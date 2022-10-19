@@ -1,0 +1,11 @@
+# To be ignored
+
+data.zip
+results/figures.zip
+data/out.CAT2.classification
+data/MG_harmonized.tsv
+data/MT_harmonized.tsv
+data/gene.map5plus
+
+preprocessed/
+results/figures

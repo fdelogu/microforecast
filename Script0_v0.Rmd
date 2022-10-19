@@ -1,0 +1,913 @@
+---
+title: "MicroForecast - Script 0"
+author: "Francesco Delogu"
+date: as.Date(now())
+output: html_document
+---
+
+# MicroForecast - Script 0
+
+## Set the environment
+
+```{r setup}
+
+options(stringsAsFactors = F, gsubfn.engine = "R")
+
+library(tidyverse)
+library(matrixStats)
+library(ggridges)
+library(compositions)
+library(MASS)
+library(caret)
+library(lubridate)
+library(imputeTS)
+library(parallel)
+library(tseries)
+library(forecast)
+library(olsrr)
+library(fable)
+library(viridis)
+library(TidyMultiqc)
+
+wd <- getwd()
+
+```
+
+
+## Load data
+
+### Load counts
+
+```{r load counts}
+
+MG.raw <- (read_tsv(paste0(wd, "/data/MG_harmonized.tsv")) %>%
+  column_to_rownames(var="ORF"))
+
+MT.raw <- (read_tsv(paste0(wd, "/data/MT_harmonized.tsv")) %>%
+  column_to_rownames(var="ORF"))
+
+MP.raw <- (read_tsv(paste0(wd, "/data/summary_prophane.tsv")) %>%
+  mutate(ORF=gsub("Good", "", gsub(";", "+", members_identifier))) %>%
+  dplyr::select(-members_identifier) %>%
+  column_to_rownames(var="ORF"))
+
+```
+
+### Load metadata
+
+```{r load metadata}
+
+LAO_meta <- read_tsv(paste0(wd, "/data/LAO_metadata.tsv"))
+colnames(LAO_meta) <- c("Date", colnames(LAO_meta)[2:length(colnames(LAO_meta))])
+LAO_meta$Date <- as.Date(LAO_meta$Date, "%m/%d/%y")
+LAO_meta$Oxygen_manual <- as.numeric(LAO_meta$Oxygen_manual)
+LAO_meta$Oxygen_sat_manual <- as.numeric(LAO_meta$Oxygen_sat_manual)
+LAO_meta$Time[is.na(LAO_meta$Time)] <- median(LAO_meta$Time, na.rm=T)
+LAO_meta <- LAO_meta %>%
+  mutate(DateTime = ymd_hms(paste(LAO_meta$Date, LAO_meta$Time, sep=" ")))
+
+Sivec_meta <- read_tsv(paste0(wd, "/data/Sivec_Schifflange.csv"))
+Sivec_meta$Date <- as.Date(Sivec_meta$Date, "%m/%d/%y")
+Sivec_meta <- Sivec_meta %>%
+  mutate(DateTime = ymd_h(paste(Sivec_meta$Date, Sivec_meta$Time, sep=" ")),
+         Time = paste0(Time, ":00:00"))
+
+LAO_samples <- read.table(paste0(wd, "/data/samples.txt"), sep=" ", header=T)
+sample_to_date <- as.Date(LAO_samples$Date)
+names(sample_to_date) <- LAO_samples$Sample
+
+MG.multiqc <- load_multiqc(paste0(wd, "/data/MG_multiqc_data.json")) %>%
+  separate(metadata.sample_id, into=c("to_delete1", "to_delete2", "to_delete3",
+                                      "to_delete4", "to_delete5","to_delete6",
+                                      "metadata.sample_id", "to_delete8", "to_delete9",
+                                      "to_delete10", "Sample"), sep=" \\| ", remove=T, extra="drop") %>%
+  dplyr::select(-c("to_delete1", "to_delete2", "to_delete3",
+                   "to_delete4", "to_delete5","to_delete6",
+                   "to_delete8", "to_delete9","to_delete10")) %>%
+  mutate(metadata.sample_id = sample_to_date[metadata.sample_id]) %>%
+  separate(Sample, into=c("to_delete1", "Read_set", "File_type"), sep="\\.", remove=T, extra="drop") %>%
+  mutate(Read_set=toupper(Read_set)) %>%
+  dplyr::select(-c("to_delete1")) %>%
+  arrange(metadata.sample_id)
+
+MT.multiqc <- load_multiqc(paste0(wd, "/data/MT_multiqc_data.json")) %>%
+  separate(metadata.sample_id, into=c("to_delete1", "to_delete2", "to_delete3",
+                                      "to_delete4", "to_delete5","to_delete6",
+                                      "metadata.sample_id", "to_delete8", "to_delete9",
+                                      "to_delete10", "Sample"), sep=" \\| ", remove=T, extra="drop") %>%
+  dplyr::select(-c("to_delete1", "to_delete2", "to_delete3",
+                   "to_delete4", "to_delete5","to_delete6",
+                   "to_delete8", "to_delete9","to_delete10")) %>%
+  mutate(metadata.sample_id = sample_to_date[metadata.sample_id]) %>%
+  separate(Sample, into=c("to_delete1", "Read_set", "File_type"), sep="\\.", remove=T, extra="drop") %>%
+  mutate(Read_set=toupper(Read_set)) %>%
+  dplyr::select(-c("to_delete1")) %>%
+  arrange(metadata.sample_id)
+
+```
+
+### Load functional annotation
+
+```{r load functional annotation}
+
+LAO_ko <- read_tsv(paste0(wd, "/data/mantis_integrated.kofam"), col_names=c("ORF", "D_code"))
+
+map_ko <- read_tsv(paste0(wd, "/data/ko.txt"))
+LAO_ko <- inner_join(LAO_ko, map_ko)
+
+```
+
+### Load taxonomical annotation
+
+```{r load taxonomical annotation}
+
+gene.map <- read_tsv(paste0(wd, "/data/gene.map5plus"), col_names=F) %>%
+  `colnames<-`(c("ORF", "contig", "subset"))
+
+bin.tax <- read_tsv(paste0(wd, "/data/out.BAT.classification")) %>%
+  `colnames<-`(c("bin", colnames(.)[-1])) %>%
+  separate(superkingdom, c("superkingdom", "to_delete"), sep=":") %>%
+  separate(phylum, c("phylum", "to_delete"), sep=":") %>%
+  separate(class, c("class", "to_delete"), sep=":") %>%
+  separate(order, c("order", "to_delete"), sep=":") %>%
+  separate(family, c("family", "to_delete"), sep=":") %>%
+  separate(genus, c("genus", "to_delete"), sep=":") %>%
+  separate(species, c("species", "to_delete"), sep=":") %>%
+  dplyr::select(-to_delete, -lineage, -`lineage scores`, -reason, -classification)
+
+bin.map <- read_tsv(paste0(wd, "/data/bin_summary.txt"), col_names=F) %>%
+  `colnames<-`(c("contig", "bin"))
+
+contig.tax <- read_tsv(paste0(wd, "/data/out.CAT2.classification")) %>%
+  `colnames<-`(c("contig", colnames(.)[-1])) %>%
+  separate(superkingdom, c("superkingdom", "to_delete"), sep=":") %>%
+  separate(phylum, c("phylum", "to_delete"), sep=":") %>%
+  separate(class, c("class", "to_delete"), sep=":") %>%
+  separate(order, c("order", "to_delete"), sep=":") %>%
+  separate(family, c("family", "to_delete"), sep=":") %>%
+  separate(genus, c("genus", "to_delete"), sep=":") %>%
+  separate(species, c("species", "to_delete"), sep=":") %>%
+  dplyr::select(-to_delete, -lineage, -`lineage scores`, -reason)
+
+contig.bin.tax <- full_join(bin.map, bin.tax)
+rm(bin.tax, bin.map)
+
+euk.bin.tax <- read_tsv(paste0(wd, "/data/euk.BAT.classification")) %>%
+  `colnames<-`(c("bin", colnames(.)[-1])) %>%
+  separate(superkingdom, c("superkingdom", "to_delete"), sep=":") %>%
+  separate(phylum, c("phylum", "to_delete"), sep=":") %>%
+  separate(class, c("class", "to_delete"), sep=":") %>%
+  separate(order, c("order", "to_delete"), sep=":") %>%
+  separate(family, c("family", "to_delete"), sep=":") %>%
+  separate(genus, c("genus", "to_delete"), sep=":") %>%
+  separate(species, c("species", "to_delete"), sep=":") %>%
+  dplyr::select(-to_delete, -lineage, -`lineage scores`, -reason, -classification)
+
+euk.bin.map <- read_tsv(paste0(wd, "/data/euk_summary.txt"), col_names=F) %>%
+  `colnames<-`(c("contig", "bin"))
+
+euk.tax <- read_tsv(paste0(wd, "/data/euk_tax.tsv"), col_names=F) %>%
+  `colnames<-`(c("contig", "to_delete", "to_delete", "to_delete", "to_delete", "to_delete", "to_delete", "to_delete", "tax")) %>%
+  dplyr::select(-to_delete) %>%
+  separate(tax, c("superkingdom", "phylum", "class", "order", "family", "genus", "species"), sep=";") %>%
+  separate(superkingdom, c("to_delete", "superkingdom"), sep="_") %>%
+  separate(phylum, c("to_delete", "phylum"), sep="_") %>%
+  separate(class, c("to_delete", "class"), sep="_") %>%
+  separate(order, c("to_delete", "order"), sep="_") %>%
+  separate(family, c("to_delete", "family"), sep="_") %>%
+  separate(genus, c("to_delete", "genus"), sep="_") %>%
+  separate(species, c("to_delete", "species"), sep="_") %>%
+  dplyr::select(-to_delete)
+
+euk.contig.bin.tax <- full_join(euk.bin.map, euk.bin.tax)
+rm(euk.bin.tax, euk.bin.map)
+
+
+all.contigs.tax <- rbind(contig.bin.tax,
+                         euk.contig.bin.tax,
+                         (contig.tax %>% mutate(bin="unbinned"))[,colnames(contig.bin.tax)],
+                         (euk.tax %>% mutate(bin="unbinned"))[,colnames(contig.bin.tax)])
+rm(contig.bin.tax, contig.tax,
+   euk.contig.bin.tax, euk.tax)
+
+LAO_tax <- full_join(gene.map, all.contigs.tax, by="contig")
+rm(gene.map, all.contigs.tax)
+
+```
+
+## Data processing functions
+
+### Filtering functions
+
+```{r Filtering functions}
+
+perc_filter <- function(X, perc, th, samples_arr=c()){
+  # X is a count matrix whose columns are the observations (samples) and the rows are the variables (genes)
+  # perc is the percentage [0-1] of observations to satisfy the condition for retaining the variable
+  # th is the threshold value for the counts
+  # samples_arr is a vector of sample names if subsetting is necessary
+  if(length(samples_arr)==0){
+    samples_arr=colnames(X)
+  }
+  N <- round(length(samples_arr)*perc)
+  to_return <- X[rowSums(X[,samples_arr]>th)>N,]
+  return(to_return)
+}
+
+censor_low <- function(X, th, rp){
+  to_return <- apply(X, 2, function(x) {ifelse(x<th, rp, x)})
+  return(to_return)
+}
+
+censor_low_par <- function(X, th, rp){
+  cl <- makeCluster(getOption("cl.cores", 10))
+  to_return <- parApply(cl=cl, X, 2, function(x) {ifelse(x<th, rp, x)})
+  return(to_return)
+}
+
+test.mat <- matrix(c(0,1,2,2,4,0), nrow=2, byrow=T) %>%
+  `colnames<-`(c("col1", "col2", "col3")) %>%
+  `rownames<-`(c("row1", "row2"))
+test.mat
+censor_low(test.mat, 1.5, 0)
+perc_filter(censor_low(test.mat, 1.5, 0), 0.3, 0.1)
+
+```
+
+### Transformation and projection
+
+```{r Transformation and projection functions}
+
+transform_left_basis <- function(vec, U_inv, s){
+  return(U_inv %*% vec / s)
+}
+
+transform_left_basis_serial <- function(dd, U, s){
+  U_inv <- ginv(U)
+  dd_right <- apply(dd, 2, transform_left_basis, U_inv=U_inv, s=s)
+  return(t(dd_right))
+}
+
+```
+
+### Interpolation function
+
+```{r Interpolation function}
+
+get_interpolated_Sivec <- function(dd, datetime){
+  for(i in datetime){
+    if(!(i %in% dd$DateTime)){
+      lower <- max(dd$DateTime[dd$DateTime<i])
+      upper <- min(dd$DateTime[dd$DateTime>i])
+      diff_time <- abs(as.numeric(min(as.numeric(difftime(lower, upper, units="mins")))))
+      diff_point <- abs(as.numeric(min(as.numeric(difftime(lower, as_datetime(i), units="mins")))))
+      if(diff_time<300){
+        mat <- matrix(nrow=diff_time, ncol=ncol(dd)-3)
+        colnames(mat) <- colnames(dd)[!colnames(dd)%in%c("Date", "Time", "DateTime")]
+        mat2 <- as.data.frame(rbind(dd[dd$DateTime==lower,!colnames(dd)%in%c("Date", "Time", "DateTime")],
+                      mat,
+                      dd[dd$DateTime==upper,!colnames(dd)%in%c("Date", "Time", "DateTime")]))
+        mat2 <- na_interpolation(mat2, option="linear")
+        arr <- c(NA, NA, NA, mat2[diff_point,])
+        names(arr) <- c("Date", "Time", "DateTime", colnames(dd)[!colnames(dd)%in%c("Date", "Time", "DateTime")])
+        arr <- arr[colnames(dd)]
+        
+        dd <- rbind(dd, arr)
+        dd[nrow(dd), "Date"] <- as.Date(format(as_datetime(i), format="%Y-%m-%d"))
+        dd[nrow(dd), "Time"] <- (format(as_datetime(i), format="%H:%M:%S"))
+        dd[nrow(dd), "DateTime"] <- as_datetime(i)
+      }
+    }
+  }
+  return(dd[dd$DateTime%in%datetime,])
+}
+
+```
+
+### Multiplicative Replacement Strategy
+
+Implementation of the Multiplicative Replacement Strategy from J.A. Martin-Fernández et al., Mathematical Geology, 35:3 (2003)
+
+```{r Multiplicative Replacement Strategy}
+
+vector_MRS <- function(x, delta){
+  sum_contraint <- sum(x)
+  zeros <- sum(x==0)
+  multiplicative_factor <- 1-((zeros*delta)/sum_contraint)
+  to_return <- ifelse(x==0, delta, x*multiplicative_factor)
+  return(to_return)
+}
+
+multiplicative_replacement <- function(X, delta=NA){
+  # X is a compostional matrix whose rows are the compositional vectors in agreement with compositions::clr
+  if(is.na(delta)){
+    delta <- 1/(ncol(X))**2 # Set default delta as 1/N**2 where N=#entries in the vectors
+  }
+  to_return <- apply(X, 1, vector_MRS, delta=delta)
+  to_return <- to_return %>%
+    `colnames<-`(rownames(X)) %>%
+    `rownames<-`(colnames(X))
+  return(t(to_return))
+}
+
+test.mat <- matrix(c(0,1,2,3,4,5), nrow=2, byrow=T) %>%
+  `colnames<-`(c("col1", "col2", "col3")) %>%
+  `rownames<-`(c("row1", "row2"))
+multiplicative_replacement(test.mat)
+test.noMRS <- clr(test.mat)
+test.MRS <- clr(multiplicative_replacement(test.mat))
+test.mat
+test.noMRS
+test.MRS
+plot(c(test.MRS), c(test.noMRS))
+
+```
+
+## Data filtering
+
+### Environmental variable collinearity reduction
+
+```{r Reduce collinearity}
+
+EnvEnvCorr <- cor(as.matrix(LAO_meta %>% dplyr::select(-Date, -Time, -Collector, -Aeration, -Sludge, -DateTime)), use="complete.obs")
+corrplot::corrplot(EnvEnvCorr)
+selected.env1 <- c("Dry_matter", "PO4.P", "Nitrat", "NH4", "Oxygen",
+                  "Conductivity", "pH_manual", "Temp_manual", "Oxygen_manual")
+corrplot::corrplot(cor(LAO_meta[,selected.env1], use="complete.obs"))
+
+EnvEnvCorr <- cor(as.matrix(Sivec_meta %>% dplyr::select(-Date, -Time, -DateTime)), use="complete.obs")
+corrplot::corrplot(EnvEnvCorr)
+selected.env2 <- c("Inflow_Volume", "Inflow_pH", "Inflow_Conductivity",
+                  "Vat1_pH", "Vat1_Sludge", "Vat1_Nitrat", "Vat1_Oxygen", "Vat1_NH4.N", "Vat1_PO4.P",
+                  "Vat2_pH", "Vat2_Sludge", "Vat2_Nitrat", "Vat2_Oxygen", "Vat2_NH4.N", "Vat2_PO4.P",
+                  "Areation", "Air_Pressure")
+corrplot::corrplot(cor(Sivec_meta[,selected.env2], use="complete.obs"))
+
+Sivec_interpolated <- rbind(Sivec_meta,
+                            get_interpolated_Sivec(Sivec_meta,
+                                                   c(LAO_meta$DateTime))) %>%
+  distinct(.keep_all = T)
+
+env_meta <- full_join(Sivec_interpolated, (LAO_meta %>% dplyr::select(-Time, -Date)))
+
+selected.env <- c(selected.env1, selected.env2)
+
+EnvEnvCorr <- cor(as.matrix(env_meta[, selected.env]), use="pairwise.complete.obs", method="spearman")
+corrplot::corrplot(EnvEnvCorr, order = "hclust")
+
+date2timedate <- LAO_meta$DateTime
+names(date2timedate) <- LAO_meta$Date
+
+selected.env <- c(selected.env1, selected.env2)
+
+selected.env3 <- c("PO4.P", "Temp_manual", "Dry_matter", "Conductivity", "Areation", "Vat1_NH4.N", "Vat2_NH4.N", "Nitrat", "Inflow_Volume", "NH4", "Oxygen", "Vat2_pH", "Oxygen_manual", "pH_manual", "Inflow_pH")
+
+```
+
+### Check batch effect
+
+```{r Aggregate data functions}
+
+MG.raw[1:10000,] %>%
+  pivot_longer(everything(), names_to="Sample", values_to="value") %>%
+  mutate(Sample=sample_to_date[Sample]) %>%
+  mutate(Group=ifelse(Sample<as.Date("2012-06-01"), "Train", "Test")) %>%
+  ggplot(aes(x=value, y=factor(as.character(Sample), levels=sort(unique(as.character(Sample)), decreasing=T)), fill=Group)) +
+  geom_density_ridges() +
+  theme_ridges() +
+  labs(x="log(Gene abundance)", y="Sample") +
+  theme(axis.text.y=element_blank())
+
+MT.raw[1:10000,] %>%
+  pivot_longer(everything(), names_to="Sample", values_to="value") %>%
+  mutate(Sample=sample_to_date[Sample]) %>%
+  mutate(Group=ifelse(Sample<as.Date("2012-06-01"), "Train", "Test")) %>%
+  ggplot(aes(x=value, y=factor(as.character(Sample), levels=sort(unique(as.character(Sample)), decreasing=T)), fill=Group)) +
+  geom_density_ridges() +
+  theme_ridges() +
+  labs(x="log(Transcript abundance)", y="Sample") +
+  theme(axis.text.y=element_blank())
+
+MP.raw[1:10000,] %>%
+  pivot_longer(everything(), names_to="Sample", values_to="value") %>%
+  mutate(Sample=sample_to_date[Sample]) %>%
+  mutate(Group=ifelse(Sample<as.Date("2012-06-01"), "Train", "Test")) %>%
+  ggplot(aes(x=value, y=factor(as.character(Sample), levels=sort(unique(as.character(Sample)), decreasing=T)), fill=Group)) +
+  geom_density_ridges() +
+  theme_ridges() +
+  labs(x="Protein abundance", y="Sample") +
+  theme(axis.text.y=element_blank())
+
+```
+
+
+## Batch effect
+
+### Check batch effect
+
+```{r Aggregate data functions}
+
+omic_type <- c("MG", "MT", "MP")
+
+for(omic.type in omic_type){
+  if(omic.type=="MP"){
+    tmp.raw <- get(paste0(omic.type, ".", "raw"))
+    print(paste0("Applying the percentage filter for ", omic.type, " raw data count."))
+    tmp.raw <- perc_filter(tmp.raw, 0.2, 0.0000001, colnames(tmp.raw)[1:51])
+    print(paste0("Applying the low value censoring for ", omic.type, " raw data count."))
+    tmp.raw <- censor_low(tmp.raw, 0.0000001, 0)
+    mean(colSums(get(paste0(omic.type, ".", "raw"))>0.001))
+  } else {
+    tmp.raw <- get(paste0(omic.type, ".", "raw"))
+    print(paste0("Exp transformation the ", omic.type, " raw data count."))
+    tmp.raw <- exp(tmp.raw)
+    print(paste0("Applying the percentage filter for ", omic.type, " raw data count."))
+    tmp.raw <- perc_filter(tmp.raw, 0.2, 0.001, colnames(tmp.raw)[1:51])
+    print(paste0("Applying the low value censoring for ", omic.type, " raw data count."))
+    tmp.raw <- censor_low_par(tmp.raw, 0.001, 0)
+    mean(colSums(get(paste0(omic.type, ".", "raw"))>0.0000001))
+  }
+  tmp.raw <- multiplicative_replacement(t(tmp.raw)) # Rotate already for clr
+  tmp.clr <- as.data.frame(t(clr(tmp.raw))) %>%
+  `colnames<-`(sample_to_date[colnames(get(paste0(omic.type, ".", "raw")))])
+  assign(paste0(omic.type, ".", "clr"), tmp.clr)
+  rm(tmp.raw, tmp.clr)
+}
+
+omic_type <- c("MG", "MT")
+for(omic.type in omic_type){
+  
+  selected.times <- sort(as_datetime(date2timedate[as.character(colnames(get(paste0(omic.type, ".", "clr"))))]))
+  env.tmp <- env_meta[env_meta$DateTime%in%selected.times, c("Date", "DateTime", selected.env3)] %>%
+    mutate(Date=as.Date(DateTime)) %>% arrange(Date) %>% dplyr::select(-DateTime)
+  env.tmp[,selected.env3] <- as.data.frame(scale(env.tmp[,selected.env3], center=T, scale=T))
+  
+  selected.tech <- c("general.total_sequences", "general.avg_sequence_length")
+  tech.df <- get(paste0(omic.type, ".", "multiqc")) %>%
+    filter(Read_set=="R1", File_type=="preprocessed") %>%
+    dplyr::select(all_of(c("metadata.sample_id", selected.tech)))
+  tech.df[,selected.tech] <- as.data.frame(scale(tech.df[,selected.tech], center=T, scale=T))
+  tech.df <- tech.df %>%
+    mutate(Date=metadata.sample_id) %>%
+    dplyr::select(-metadata.sample_id)
+  
+  pre.dummy <- full_join(env.tmp, tech.df) %>%
+    arrange(Date) %>%
+    dplyr::select(-Date)
+  
+  pre.dummy[is.na(pre.dummy)] <- 0
+  pre.dummy <- as.matrix(pre.dummy)
+  
+  tmp.betas <- as.data.frame(t(lm(t(get(paste0(omic.type, ".", "clr")))~pre.dummy)$coefficients))  %>%
+    `colnames<-`(c("(Intercept)", selected.env3, "general.total_sequences", "general.avg_sequence_length"))
+  
+  assign(paste0(omic.type, ".", "betas"), tmp.betas)
+  rm(tmp.betas)
+  
+}
+
+short_batch_names <- c("LAO [0/1]", "Read fail [%]", "Reads [N]", "<Read length> [Nt]", "Read dupl. [%]", "Read GC [%]")
+names(short_batch_names) <- c("LAO", "general.percent_fails", "general.total_sequences", "general.avg_sequence_length","general.percent_duplicates", "general.percent_gc")
+
+MGMT.batch.plot <- rbind((MG.betas %>%
+  pivot_longer(names_to="Expl.var", values_to="beta", -"(Intercept)") %>%
+  mutate(Omic="MG")),
+  (MT.betas %>%
+  pivot_longer(names_to="Expl.var", values_to="beta", -"(Intercept)") %>%
+  mutate(Omic="MT"))) %>%
+  filter(Expl.var%in%c("general.total_sequences", "general.avg_sequence_length")) %>%
+  mutate(Expl.var=short_batch_names[Expl.var]) %>%
+  ggplot(aes(x=Expl.var, y=beta, fill=Expl.var)) +
+  geom_violin() +
+  theme_classic() +
+  theme(legend.position=0,
+        axis.text.x=element_text(angle=60, hjust=1),
+        panel.grid.major=element_line(colour="grey", size=0.25, linetype="dashed"),
+        panel.grid.major.x=element_blank()) +
+  facet_grid(Omic~Expl.var, scales="free") +
+  labs(x="Technical variables", y="Beta distribution")
+
+ggsave(paste0(wd, "/results/figures/MGMT_batch_paper.png"), MGMT.batch.plot, dpi=320, height=7, width=6)
+ggsave(paste0(wd, "/results/figures/MGMT_batch_paper.svg"), MGMT.batch.plot, dpi=320, height=7, width=6)
+
+```
+
+### Further batch quantification
+
+```{r Further batch quantifications}
+
+omic_type <- c("MG", "MT")
+
+shapiro.mat <- as.data.frame(matrix(nrow=length(omic_type)*4*10, ncol=4)) %>%
+  `colnames<-`(c("Omic", "Expl.var", "Iteration", "P.value"))
+
+counter <- 0
+for(omic.type in omic_type){
+  for(j in 1:10){
+    for(k in c("general.total_sequences", "general.avg_sequence_length")){
+      
+      counter <- counter + 1
+      shapiro.p <- shapiro.test(get(paste0(omic.type, ".", "betas"))[sample(1:nrow(get(paste0(omic.type, ".", "betas"))), 5000), k])$p.value
+      shapiro.p <- formatC(shapiro.p, format = "e", digits = 1)
+      shapiro.mat[counter,] <- c(omic.type, k, j, shapiro.p)
+      
+    }
+  }
+}
+
+for(omic.type in omic_type){
+  
+  write_tsv(shapiro.mat %>%
+              filter(Omic==omic.type) %>%
+              pivot_wider(names_from=Iteration, values_from=P.value, id_cols=Expl.var), paste0(wd, "/results/tables/", omic.type,"_shapiro.tsv"))
+
+}
+  
+```
+
+
+### Remove technical effects
+
+```{r Substract technical effects}
+
+comp_tech <- function(mat.quant, mat.tech, mat.betas, index){
+  as.numeric(mat.quant[index,])-(rowSums(mat.tech*t(mat.betas[index,])))
+}
+
+omic_type <- c("MG", "MT", "MP")
+
+for(omic.type in omic_type){
+  
+  if(omic.type=="MP"){
+    tmp.clr.corr <- get(paste0(omic.type, ".clr"))
+  } else {
+    
+    dummy.df <- data.frame(Date=sort(sample_to_date[!names(sample_to_date)%in%c("A01", "A02")]),
+                         LAO=c(rep(0, 51), rep(1, 21)))
+    
+    selected.tech <- c("general.total_sequences", "general.avg_sequence_length")
+    tech.df <- get(paste0(omic.type, ".", "multiqc")) %>%
+      filter(Read_set=="R1", File_type=="preprocessed") %>%
+      dplyr::select(all_of(c("metadata.sample_id", selected.tech)))
+    tech.df[,selected.tech] <- as.data.frame(scale(tech.df[,selected.tech], center=T, scale=T))
+    tech.df <- tech.df %>%
+      mutate(Date=metadata.sample_id) %>%
+      dplyr::select(-metadata.sample_id)
+    
+    pre.dummy <- full_join(dummy.df, tech.df) %>%
+      arrange(Date) %>%
+      dplyr::select(-Date)
+    
+    pre.dummy[is.na(pre.dummy)] <- 0
+    pre.dummy <- as.matrix(pre.dummy)
+   
+    a <- data.frame(pre.dummy)
+    b <- get(paste0(omic.type, ".", "betas"))[,c("general.total_sequences", "general.avg_sequence_length")]
+    
+    cl <- makeCluster(getOption("cl.cores", 10))
+    tmp.clr.corr <- as.data.frame(t(as.data.frame(parSapply(cl, as.list(1:nrow(get(paste0(omic.type, ".", "clr")))), comp_tech, mat.quant=get(paste0(omic.type, ".", "clr")), mat.tech=a, mat.betas=b)))) %>%
+    `colnames<-`(c(colnames(get(paste0(omic.type, ".", "clr"))))) %>%
+    `rownames<-`(c(rownames(get(paste0(omic.type, ".", "clr")))))
+    
+    rm(a, b, cl)
+  }
+
+  assign(paste0(omic.type, ".", "clr.corr"), tmp.clr.corr)
+
+  rm(tmp.clr.corr)
+  
+}
+
+```
+
+
+## Aggragate data according to annotation
+
+### Aggragate data functions
+
+```{r Aggregate data functions}
+
+reformat_ORFG_ann <- function(ORFG_names, ann, col_names){
+  temp.dd <- data.frame(ORFG=ORFG_names, ORF=ORFG_names) %>%
+    separate_rows(ORF, sep="\\+", convert=TRUE)
+  to_return <- inner_join(temp.dd, ann[,colnames(ann)%in%c("ORF", col_names)]) %>%
+    group_by(across(all_of(col_names)), ORFG) %>%
+    summarise(.groups="keep")
+  return(to_return)
+}
+
+```
+
+
+### Aggragate data w/ functional annotation
+
+```{r Aggregate data w/ functional annotation}
+
+omic_type <- c("MG", "MT", "MP")
+analysis_type <- c("fun")
+
+set_type <- (expand.grid(a=omic_type, b=analysis_type) %>% mutate(d=paste(a, b, sep=".")))$d
+
+for(i in omic_type){
+  dd.tmp <- reformat_ORFG_ann(rownames(get(paste0(i, ".raw"))), LAO_ko%>%filter(A_name=="Metabolism"), c("A_name", "B_name", "C_name", "D_name"))
+  dd.tmp <- inner_join(dd.tmp, get(paste0(i, ".raw")) %>% rownames_to_column(var="ORFG"))
+  assign(paste0(i, ".fun"), dd.tmp)
+}
+
+KEGG_levels <- c("C_name", "D_name")
+set_type.KEGG_level <- (expand.grid(a=set_type, b=KEGG_levels) %>% mutate(d=paste(a, b, sep=".")))$d
+
+cycles.dbs <- paste(omic_type, "raw", sep=".")
+counter <- 1
+
+for(i in set_type){
+  for(j in KEGG_levels){
+    print(paste0(i, ".", j))
+    dd.tmp <- get(i) %>%
+      ungroup %>%
+      dplyr::select(all_of(c(colnames(get(cycles.dbs[counter])), j)), ORFG) %>%
+      pivot_longer(names_to="Sample", values_to="value", -c(all_of(j), ORFG)) %>%
+      group_by(get(j), Sample) %>%
+      summarise(Value=log(sum(exp(value))), .groups="keep") %>%
+      ungroup() %>%
+      pivot_wider(names_from=Sample, values_from=Value) %>%
+      column_to_rownames(var="get(j)")
+    assign(paste0(i, ".", j), dd.tmp)
+  }
+  counter <- counter + 1
+}
+
+```
+
+### Aggragate data w/ taxonomic annotation
+
+```{r Aggregate data w/ taxonomic annotation}
+
+omic_type <- c("MG", "MT", "MP")
+analysis_type <- c("tax")
+tax_lvl <- c("superkingdom", "phylum", "class", "order", "family", "genus", "species")
+
+set_type <- (expand.grid(a=omic_type, b=analysis_type) %>% mutate(d=paste(a, b, sep=".")))$d
+
+for(i in omic_type){
+  dd.tmp <- reformat_ORFG_ann(rownames(get(paste0(i, ".raw"))), LAO_tax, tax_lvl)
+  dd.tmp <- inner_join(dd.tmp, get(paste0(i, ".raw")) %>% rownames_to_column(var="ORFG"))
+  assign(paste0(i, ".tax"), dd.tmp)
+}
+
+set_type.tax_level <- (expand.grid(a=set_type, b=tax_lvl) %>% mutate(d=paste(a, b, sep=".")))$d
+
+cycles.dbs <- paste(omic_type, "raw", sep=".")
+counter <- 1
+
+for(i in set_type){
+  for(j in rev(tax_lvl)){
+    print(paste0(i, ".", j))
+
+    dd.tmp <- get(i) %>%
+    replace_na(list(superkingdom="not classified", phylum="not classified",
+                    class="not classified", order="not classified",
+                    family="not classified", genus="not classified",
+                    species="not classified")) %>%
+    ungroup %>%
+    dplyr::select(all_of(c(colnames(get(i)), tax_lvl)), ORFG) %>%
+    pivot_longer(names_to="Sample", values_to="value", -c(all_of(tax_lvl), ORFG)) %>%
+    `colnames<-`(c(tax_lvl, "ORFG", "Sample", "value"))
+
+    if(i=="MP.tax"){
+      dd.tmp <- dd.tmp %>% group_by(get(j), Sample) %>%
+      summarise(Value=sum(value), .groups="keep") %>%
+      ungroup()
+    } else {
+      dd.tmp <- dd.tmp %>% group_by(get(j), Sample) %>%
+      summarise(Value=log(sum(exp(value))), .groups="keep") %>%
+      ungroup()
+    }
+    
+    dd.tmp <- dd.tmp %>%
+      pivot_wider(names_from=Sample, values_from=Value) %>%
+      column_to_rownames(var="get(j)")
+    assign(paste0(i, ".", j), dd.tmp[,colnames(get(i))[9:ncol(get(i))]])
+  }
+  
+  counter <- counter + 1
+}
+
+```
+
+## Split train/test data
+
+### Split data functions
+
+```{r split data}
+
+prep_data_mats <- function(mat, multiqc_table){
+  
+  mat <- exp(mat)
+  mat <- perc_filter(mat, 0.2, 0.001, colnames(mat)[1:51])
+  mat <- censor_low(mat, 0.001, 0)
+  mat <- as.data.frame(t(clr(multiplicative_replacement(t(mat)))))
+  mat <- as.data.frame(t(clr(t(mat))))
+  colnames(mat) <- sample_to_date[colnames(mat)]
+  
+  selected.times <- sort(as_datetime(date2timedate[as.character(colnames(get(paste0(omic.type, ".", "clr"))))]))
+  env.tmp <- env_meta[env_meta$DateTime%in%selected.times, c("Date", "DateTime", selected.env3)] %>%
+    mutate(Date=as.Date(DateTime)) %>% arrange(Date) %>% dplyr::select(-DateTime)
+  env.tmp[,selected.env3] <- as.data.frame(scale(env.tmp[,selected.env3], center=T, scale=T))
+  
+  selected.tech <- c("general.total_sequences", "general.avg_sequence_length")
+  tech.df <- get(paste0(omic.type, ".", "multiqc")) %>%
+    filter(Read_set=="R1", File_type=="preprocessed") %>%
+    dplyr::select(all_of(c("metadata.sample_id", selected.tech)))
+  tech.df[,selected.tech] <- as.data.frame(scale(tech.df[,selected.tech], center=T, scale=T))
+  tech.df <- tech.df %>%
+    mutate(Date=metadata.sample_id) %>%
+    dplyr::select(-metadata.sample_id)
+
+  pre.dummy <- full_join(env.tmp, tech.df) %>%
+    arrange(Date) %>%
+    dplyr::select(-Date)
+  
+  pre.dummy[is.na(pre.dummy)] <- 0
+  pre.dummy <- as.matrix(pre.dummy)
+  
+  tmp.betas <- as.data.frame(t(lm(t(get(paste0(omic.type, ".", "clr")))~pre.dummy)$coefficients))  %>%
+    `colnames<-`(c("(Intercept)", selected.env3, "general.total_sequences", "general.avg_sequence_length"))
+    
+    
+  a <- as.data.frame(pre.dummy)
+  b <- tmp.betas[,c("general.total_sequences", "general.avg_sequence_length")]
+  
+  cl <- makeCluster(getOption("cl.cores", 10))
+  mat.clr.corr <- as.data.frame(t(as.data.frame(parSapply(cl, as.list(1:nrow(mat)), comp_tech, mat.quant=mat, mat.tech=a, mat.betas=b)))) %>%
+  `colnames<-`(c(colnames(mat))) %>%
+  `rownames<-`(c(rownames(mat)))
+  
+  mat.train.clr.corr <- mat.clr.corr[, colnames(mat.clr.corr) < "2012-05-31"]
+  mat.train.svd.corr <- svd(mat.train.clr.corr)
+  
+  mat.test.clr.corr <- mat.clr.corr[, colnames(mat.clr.corr) > "2012-05-31"]
+  mat.test.svd.corr <- transform_left_basis_serial(mat.test.clr.corr, mat.train.svd.corr$u, mat.train.svd.corr$d)
+  
+  return(list(mat.train.clr.corr, mat.test.clr.corr, mat.train.svd.corr, mat.test.svd.corr))
+  
+}
+
+prep_data_mats_var <- function(mat){
+  
+  mat <- perc_filter(mat, 0.2, 0.0000001, colnames(mat)[1:51])
+  mat <- censor_low(mat, 0.0000001, 0)
+  
+  mat <- as.data.frame(t(clr(multiplicative_replacement(t(mat)))))
+  colnames(mat) <- sample_to_date[colnames(mat)]
+  
+  mat.train.clr.corr <- mat
+  mat.train.svd.corr <- svd(mat.train.clr.corr)
+  
+  mat.test.clr.corr <- ""
+  mat.test.svd.corr <- ""
+  
+  return(list(mat.train.clr.corr, mat.test.clr.corr, mat.train.svd.corr, mat.test.svd.corr))
+  
+}
+
+```
+
+
+### Quantitative exploration
+
+```{r Quantitative exploration}
+
+hist(apply(MT.tax.genus, 1, quantile, probs=c(.75)))
+
+hist(apply(MG.fun.C_name, 1, quantile, probs=c(.75)))
+
+MG.fun.C_name[apply(MG.fun.C_name, 1, quantile, probs=c(.75))>11,] %>%
+  rownames_to_column("Reaction") %>%
+  pivot_longer(names_to="Sample", values_to="value", -Reaction) %>%
+  mutate(Sample=sample_to_date[Sample]) %>%
+  ggplot(aes(x=Sample, y=value, fill=Reaction)) +
+  geom_bar(stat="identity")
+
+a <- t.test(exp(as.numeric(MG.fun.C_name["Fatty acid degradation", 11:14])), exp(as.numeric(MG.fun.C_name["Fatty acid degradation", 52:56])))
+
+plot(log(c(exp(as.numeric(MG.fun.C_name["Fatty acid degradation", 1:51])), exp(as.numeric(MG.fun.C_name["Fatty acid degradation", 52:72]))-(a$estimate[2]-a$estimate[1]))), type="b")
+
+```
+
+
+### Data split and correct
+
+```{r Data split}
+
+omic_type <- c("MG", "MT", "MP")
+#omic_type <- c("MP")
+fun_lvl <- paste("fun", c("C_name", "D_name"), sep=".")
+tax_lvl <- paste("tax", c("superkingdom", "phylum", "class", "order", "family", "genus", "species"), sep=".")
+subsets <- c(fun_lvl, tax_lvl)
+#set_type <- c((expand.grid(a=omic_type, b=subsets) %>% mutate(d=paste(a, b, sep=".")))$d)
+
+for(omic.type in omic_type){
+  for(i in subsets){
+    j <- paste0(omic.type, ".", i)
+    print(j)
+    if(omic.type=="MP"){
+      cycle_list <- prep_data_mats_var(get(j)[,names(sort(sample_to_date[colnames(get(j))]))]) # sort?
+    } else {
+      cycle_list <- prep_data_mats(get(j)[,names(sort(sample_to_date[colnames(get(j))]))], MG.multiqc) # sort?
+    }
+    assign(paste0(j, ".", "train.clr.corr"), cycle_list[[1]])
+    assign(paste0(j, ".", "test.clr.corr"), cycle_list[[2]])
+    assign(paste0(j, ".", "train.svd.corr"), cycle_list[[3]])
+    assign(paste0(j, ".", "test.svd.corr"), cycle_list[[4]])
+  }
+      
+  assign(paste0(omic.type, ".raw.train.clr.corr"),
+         get(paste0(omic.type, ".clr.corr"))[,sort(colnames(get(paste0(omic.type, ".clr.corr"))))][, colnames(get(paste0(omic.type, ".clr.corr"))) < "2012-05-31"])
+  assign(paste0(omic.type, ".raw.train.svd.corr"),
+         svd(get(paste0(omic.type, ".raw.train.clr.corr"))))
+    
+  assign(paste0(omic.type, ".raw.test.clr.corr"),
+         get(paste0(omic.type, ".clr.corr"))[sort(colnames(get(paste0(omic.type, ".clr.corr"))))][, colnames(get(paste0(omic.type, ".clr.corr"))) > "2012-05-31"])
+  assign(paste0(omic.type, ".raw.test.svd.corr"),
+         transform_left_basis_serial(get(paste0(omic.type, ".raw.test.clr.corr")),
+                                     get(paste0(omic.type, ".raw.train.svd.corr"))$u,
+                                     get(paste0(omic.type, ".raw.train.svd.corr"))$d))
+}
+
+```
+
+
+### Print first EGs
+
+```{r Print first EGs}
+
+for(i in 1:5){
+  simple.plot <- data.frame(Sample=as.Date(colnames(MG.raw.train.clr.corr)), value=MG.raw.train.svd.corr$v[,i]) %>%
+    ggplot(aes(x=Sample, y=value, group=1)) +
+    geom_point() +
+    geom_line() +
+    theme_minimal()
+  print(simple.plot)
+}
+for(i in 1:5){
+  simple.plot <- data.frame(Sample=as.Date(colnames(MT.raw.train.clr.corr)), value=MT.raw.train.svd.corr$v[,i]) %>%
+    ggplot(aes(x=Sample, y=value, group=1)) +
+    geom_point() +
+    geom_line() +
+    theme_minimal()
+  print(simple.plot)
+}
+
+for(i in 1:5){
+  simple.plot <- data.frame(Sample=as.Date(colnames(MG.fun.C_name.train.clr.corr)), value=as.numeric(MG.fun.C_name.train.clr.corr[i,])) %>%
+    ggplot(aes(x=Sample, y=value, group=1)) +
+    geom_point() +
+    geom_line() +
+    theme_minimal()
+  print(simple.plot)
+}
+
+for(i in 1:5){
+  simple.plot <- data.frame(Sample=as.Date(colnames(MG.fun.C_name.train.clr.corr)), value=as.numeric(MG.fun.C_name.train.svd.corr$v[,i])) %>%
+    ggplot(aes(x=Sample, y=value, group=1)) +
+    geom_point() +
+    geom_line() +
+    theme_minimal()
+  print(simple.plot)
+}
+
+```
+
+### Experimantal batches
+
+```{r Experimantal batches}
+
+date_to_sample <- names(sample_to_date)
+names(date_to_sample) <- sample_to_date
+tmp.mat <- MG.raw.train.svd.corr$v
+plot(tmp.mat[,1], type = "b")
+rownames(tmp.mat) <- date_to_sample[colnames(MG.raw.train.clr.corr)]
+tmp.mat <- tmp.mat[sort(rownames(tmp.mat)),]
+plot(tmp.mat[,1], type = "b")
+
+```
+
+
+### Output split data
+
+```{r Output split data}
+
+omic_type <- c("MG", "MT", "MP")
+fun_lvl <- paste("fun", c("C_name", "D_name"), sep=".")
+tax_lvl <- paste("tax", c("superkingdom", "phylum", "class", "order", "family", "genus", "species"), sep=".")
+subsets <- c(fun_lvl, tax_lvl)
+set_type <- c((expand.grid(a=omic_type, b=subsets) %>% mutate(d=paste(a, b, sep=".")))$d)
+
+save(file=paste0(wd, "/preprocessed/preprocessed_mats_MRS_sampels.RData"),
+     list=c((expand.grid(a=c(set_type, "MG.raw", "MT.raw", "MP.raw"),
+                         b=c(".train.clr.corr", ".test.clr.corr", ".train.svd.corr", ".test.svd.corr"))
+             %>% mutate(d=paste0(a, b)))$d), set_type)
+
+```
+

@@ -1,0 +1,742 @@
+---
+title: "LAO analysis, prediction and validation"
+author: "Francesco Delogu"
+date: as.Date(now())
+output: html_document
+---
+
+# Analysis of LAO, prediction and validation of future samples
+
+## Set the environment
+
+```{r setup}
+
+options(stringsAsFactors = F, gsubfn.engine = "R")
+
+Sys.setenv("LANGUAGE"="En")
+
+library(tidyverse)
+library(matrixStats)
+library(ggridges)
+library(compositions)
+library(MASS)
+library(caret)
+library(lubridate)
+library(imputeTS)
+library(parallel)
+library(tseries)
+library(forecast)
+library(olsrr)
+library(fable)
+library(viridis)
+library(TidyMultiqc)
+library(GSEABase)
+library(AnnotationDbi)
+library(ggnewscale)
+library(WGCNA)
+library(GOstats)
+library(lmtest)
+
+wd <- getwd()
+
+```
+
+
+## Load data
+
+### Load counts
+
+```{r load counts}
+
+load(paste0(wd, "/preprocessed/preprocessed_mats_MRS_sampels.RData"))
+
+```
+
+## Time dependency analysis
+
+### Tests for time dependency
+
+Time dependency is tested using four sattistical tets:
+- Box test [G.M Ljung, G.E.P. Box, Biometrika (1978)]
+- Augmented Dickey–Fuller Test [A. Banerjee, et al., Cointegration, Error Correction, and the Econometric Analysis of Non-Stationary Data (1993)]
+- KPSS Test for Stationarity with null hypothesys "Level" [D. Kwiatkowski, et al., J. Econom. (1992)]
+- KPSS Test for Stationarity with null hypothesys "Trend" [D. Kwiatkowski, et al., J. Econom. (1992)]
+
+
+```{r autocorrelation, echo=F, message=F, warning=F}
+
+impute_weekly <- function(mat, dates_arr){
+
+  X <- as.character(floor(difftime(dates_arr, dates_arr[1], units="weeks")))
+  colnames(mat) <- X
+  filled_X <- as.character(0:X[length(X)])
+  
+  new_mat <- cbind(matrix(ncol=sum(!filled_X%in%X), nrow=nrow(mat)) %>%
+    `colnames<-`(filled_X[!filled_X%in%X]),
+    mat)[,filled_X]
+  
+  patched_Y <- data.frame(apply(as.data.frame(new_mat), function(x) approxfun(seq_along(x), x)(seq_along(x)), MARGIN=1))
+  return(t(patched_Y))
+  
+}
+
+non_stationary_EGs <- function(mat, p_val=0.01, th=1){
+  # p_val = p value for the statistical tests
+  # th = how many tests (out of the four implemented) have to be passed to consider the EG non-stationary
+  
+  #mat <- t(mat)
+  stat.tests <- matrix(NA, ncol=4, nrow=ncol(mat))
+  rownames(stat.tests) <- colnames(mat)
+  colnames(stat.tests) <- c("LB", "ADF", "KPSS.trend", "KPSS.level")
+  
+  for(i in 1:ncol(mat)){
+    y_tmp <- unlist(mat[,i])
+    stat.tests[i,] <- c(Box.test(y_tmp, lag=1, type="Ljung-Box")$p.value,
+                        adf.test(y_tmp)$p.value,
+                        kpss.test(y_tmp, null=c("Trend"))$p.value,
+                        kpss.test(y_tmp, null=c("Level"))$p.value)
+  }
+  
+  stat.tests[,c(1,3,4)] <- ifelse(stat.tests[,c(1,3,4)]<p_val, 1, 0)
+  stat.tests[,2] <- ifelse(stat.tests[,2]>p_val, 1, 0)
+  corrplot::corrplot(stat.tests)
+  
+  return((1:nrow(stat.tests))[rowSums(stat.tests)>=th])
+
+}
+
+```
+
+
+### Non-stationary EGs
+
+```{r EG test data plots}
+
+omic_type <- c("MG", "MT", "MP")
+fun_lvl <- paste("fun", c("C_name", "D_name"), sep=".")
+tax_lvl <- paste("tax", c("phylum", "class", "order", "family", "genus", "species"), sep=".")
+subsets <- c(fun_lvl, tax_lvl)
+set_type <- c((expand.grid(a=omic_type, b=subsets) %>% mutate(d=paste(a, b, sep=".")))$d, "MG.raw", "MT.raw", "MP.raw")
+
+options(warn = -1)
+
+for(i in set_type){
+  if(startsWith(i, "MO")){
+    cycle_mat <- paste0(i, ".", "train.svd")
+  } else {
+    cycle_mat <- paste0(i, ".", "train.svd.corr")
+  }
+  
+  weekly_imputed <- t(impute_weekly(t(get(cycle_mat)$v), colnames(MT.raw.train.clr.corr)))
+  EGs_cycle <- non_stationary_EGs(weekly_imputed, th=2)
+  assign(paste0(i, ".NonStatEG.corr"), EGs_cycle)
+  
+}
+
+options(warn = 0)
+
+```
+
+
+### Non-stationary EGs per set
+
+```{r EG test data plots}
+
+omic_type <- c("MG", "MT", "MP")
+fun_lvl <- paste("fun", c("C_name", "D_name"), sep=".")
+tax_lvl <- paste("tax", c("phylum", "class", "order", "family", "genus", "species"), sep=".")
+subsets <- c(fun_lvl, tax_lvl)
+set_type <- c((expand.grid(a=omic_type, b=subsets) %>% mutate(d=paste(a, b, sep=".")))$d, "MG.raw", "MT.raw", "MP.raw")
+
+nEGs <- matrix(0, ncol=length(omic_type), nrow=length(set_type)/length(omic_type)) %>%
+  `colnames<-`(omic_type) %>%
+  `rownames<-`(c("raw", rev(subsets)))
+
+for(i in omic_type){
+  for(j in c("raw", subsets)){
+    if(i=="MO"){
+      set_cycle <- paste(i, j, "NonStatEG", sep=".")
+    } else {
+      set_cycle <- paste(i, j, "NonStatEG.corr", sep=".")
+    }
+    nEGs[j,i] <- length(get(set_cycle))
+  }
+}
+
+
+percEGs <- matrix(0, ncol=length(omic_type), nrow=length(set_type)/length(omic_type)) %>%
+  `colnames<-`(omic_type) %>%
+  `rownames<-`(c("raw", rev(subsets)))
+
+for(i in omic_type){
+  for(j in c("raw", subsets)){
+    if(startsWith(i, "MO")){
+      set_cycle <- paste(i, j, "NonStatEG", sep=".")
+      EGval_cycle <- paste(i, j, "train.svd", sep=".")
+    } else {
+      set_cycle <- paste(i, j, "NonStatEG.corr", sep=".")
+      EGval_cycle <- paste(i, j, "train.svd.corr", sep=".")
+    }
+    tmp.mat <- get(EGval_cycle)$d
+    N <- length(tmp.mat)
+    percEGs[j,i] <- sum((tmp.mat[2:N]/sum(tmp.mat[2:N]))[(get(set_cycle))-1])
+  }
+}
+
+nEGs
+percEGs
+
+short_names_NonStatES <- c("ORFs",
+                           "Tax Phylum", "Tax Class", "Tax Order", "Tax Family", "Tax Genus", "Tax Species",
+                           "Fun KO", "Fun Pathway")
+names(short_names_NonStatES) <- c("raw",
+                                        "tax.phylum", "tax.class", "tax.order", "tax.family", "tax.genus", "tax.species",
+                                        "fun.D_name", "fun.C_name")
+
+Non.Stat.plot <- rbind(as.data.frame(nEGs) %>%
+    rownames_to_column(var="Subset") %>%
+    pivot_longer(names_to="Omic", values_to="Value", -Subset) %>%
+    mutate(Quant="EG counts [N]"),
+  as.data.frame(percEGs) %>%
+    rownames_to_column(var="Subset") %>%
+    pivot_longer(names_to="Omic", values_to="Value", -Subset) %>%
+    mutate(Quant="EG weight [%]", Value=Value*100)) %>%
+  mutate(Subset=short_names_NonStatES[Subset]) %>%
+  mutate(Subset=factor(Subset, levels=rev( c("ORFs",
+                           "Tax Phylum", "Tax Class", "Tax Order", "Tax Family", "Tax Genus", "Tax Species",
+                           "Fun KO", "Fun Pathway"))),
+         Omic=factor(Omic, levels=c("MG", "MT", "MP"))) %>%
+  ggplot(aes(x=Subset, y=Value, fill=Subset)) +
+  geom_bar(stat="identity") +
+  coord_flip() +
+  facet_grid(Omic~Quant, scales="free_x") + 
+  geom_rect(aes(xmin=-Inf, xmax=Inf, ymin=-Inf, ymax=Inf),
+            colour="black", fill=NA, inherit.aes=FALSE, size=0.5) +
+  theme_classic() +
+  theme(panel.grid.major = element_line(colour="grey", size=0.25, linetype="dashed"),
+        legend.position = "none", panel.grid.major.y = element_blank()) +
+  scale_y_continuous(expand=c(0.01, 0.01), breaks = function(x) unique(floor(pretty(seq(0, (max(x) + 1) * 1.1))))) +
+  scale_fill_viridis(discrete=T, option="viridis")
+
+Non.Stat.plot
+
+ggsave(paste0(wd, "/results/figures/NonStatEGsComparison_corrMRS.png"), Non.Stat.plot, dpi=320, height=5, width=6)
+ggsave(paste0(wd, "/results/figures/NonStatEGsComparison_corrMRS.svg"), Non.Stat.plot, dpi=320, height=5, width=6)
+
+```
+
+## EG analysis
+
+### Time-dependent EG correlations
+
+```{r Time-dependent EG correlations}
+
+omic_type <- c("MG", "MT", "MP")
+fun_lvl <- paste("fun", c("C_name", "D_name"), sep=".")
+tax_lvl <- paste("tax", c("phylum", "class", "order", "family", "genus", "species"), sep=".")
+subsets <- c(fun_lvl, tax_lvl)
+set_type <- paste0(c((expand.grid(a=omic_type, b=subsets) %>% mutate(d=paste(a, b, sep=".")))$d, "MG.raw.a", "MT.raw.a", "MP.raw.a"))
+set_type_dd <- paste0(c((expand.grid(a=omic_type, b=subsets) %>% mutate(d=paste(a, b, sep=".")))$d, "MG.raw", "MT.raw", "MP.raw"), ".train.svd.corr")
+
+all.EGs <- t(impute_weekly(t(do.call(cbind, lapply(as.list(set_type_dd), function(x) get(x)$v))), colnames(MT.raw.train.clr.corr)))
+all.EVs <- unlist(lapply(as.list(set_type_dd), function(x) get(x)$d))
+EG_names <- unlist(lapply(set_type_dd, function(x) paste0(paste(unlist(str_split(x, "\\."))[1:3], collapse="."), ".EG", 1:ncol(get(x)$v))))
+EG_names <- str_replace(EG_names, "train", "a")
+
+EVs.dd <- data.frame(value=all.EVs, EG_name=EG_names) %>%
+  separate(EG_name, into=c("Omic", "Set", "Subset", "EG_num"), sep="\\.", remove=F) %>%
+  group_by(Omic, Set, Subset) %>%
+  mutate(ES=sum(value), value.perc=value/ES, value.censored=value)
+EVs.dd[EVs.dd$EG_num=="EG1","value.censored"] <- 0
+EVs.dd <- EVs.dd %>%
+  group_by(Omic, Set, Subset) %>%
+  mutate(ES.scaled=sum(value.censored), value.scaled=value.censored/ES.scaled)
+
+subsets <- c(fun_lvl, tax_lvl)
+set_raw <- c("raw")
+set_old_type <- paste0(c((expand.grid(a=omic_type, b=subsets) %>% mutate(d=paste(a, b, sep=".")))$d, "MG.raw.a", "MT.raw.a", "MP.raw.a"))
+set_type <- c(paste0(c((expand.grid(a=omic_type, b=subsets) %>% mutate(d=paste(a, b, sep=".")))$d)))
+set_raw_type <- paste0(c((expand.grid(a=omic_type, b=set_raw) %>% mutate(d=paste(a, b, sep=".")))$d))
+
+non_stat_tot <- c(unlist(sapply(set_type, function(x) paste(x, ".EG", get(paste(x, "NonStatEG.corr", sep=".")), sep=""))),
+                  unlist(sapply(set_raw_type, function(x) paste(x, ".EG", get(paste(x, "NonStatEG.corr", sep=".")), sep=""))))
+
+non_stat_tot_a <- c(unlist(sapply(set_type, function(x) paste(x, ".EG", get(paste(x, "NonStatEG.corr", sep=".")), sep=""))),
+                  unlist(sapply(set_raw_type, function(x) paste(x, ".a.EG", get(paste(x, "NonStatEG.corr", sep=".")), sep=""))))
+
+EG_names <- unlist(lapply(set_type_dd, function(x) paste0(paste(unlist(str_split(x, "\\."))[1:3], collapse="."), ".EG", 1:ncol(get(x)$v))))
+EG_names <- str_replace(EG_names, "train", "a")
+
+Adj0 <- cor((all.EGs[1:nrow(all.EGs),] %>%
+               `colnames<-`(EG_names))[,non_stat_tot_a],
+            (all.EGs[1:nrow(all.EGs),] %>%
+               `colnames<-`(EG_names))[,non_stat_tot_a],
+            method="pearson")
+
+```
+
+
+### EG clustering
+
+```{r, EGs clustering}
+
+EG.dist <- as.matrix(dist((Adj0), method="minkowski")) #euclidean
+
+EG.hc <- hclust(as.dist(EG.dist), method="complete");
+sizeGrWindow(12,9)
+plot(EG.hc, xlab="", sub="", main="Gene clustering on TOM-based dissimilarity", labels=F, hang=0.04)
+
+minModuleSize <- 3
+dynamicMods = cutreeDynamic(dendro=EG.hc, distM=EG.dist, deepSplit=0, pamRespectsDendro=FALSE, minClusterSize=minModuleSize)
+table(dynamicMods)
+
+dynamicColors <- labels2colors(dynamicMods)
+table(dynamicColors)
+
+sizeGrWindow(8,6)
+plotDendroAndColors(EG.hc, dynamicColors, "Dynamic Tree Cut", dendroLabels=F, hang=0.03, addGuide=T, guideHang=0.05, main="Gene dendrogram and module colors")
+
+```
+
+### Further EG clustering
+
+```{r EG clustering 2}
+
+MEList = moduleEigengenes(abs(Adj0), colors=dynamicColors)
+MEs = MEList$eigengenes
+MEDiss = 1-cor(MEs);
+METree = hclust(as.dist(MEDiss), method="complete");
+sizeGrWindow(7, 6)
+plot(METree, main = "Clustering of module eigengenes", xlab = "", sub = "")
+
+MEDissThres = 0.0
+abline(h=MEDissThres, col = "red")
+merge = mergeCloseModules(abs(Adj0), dynamicColors, cutHeight=MEDissThres, verbose = 3)
+mergedColors = merge$colors
+mergedMEs = merge$newMEs
+
+```
+
+
+```{r, merged clusters}
+
+sizeGrWindow(12, 9)
+plotDendroAndColors(EG.hc, cbind(dynamicColors, mergedColors), c("Dynamic Tree Cut", "Merged dynamic"), dendroLabels = FALSE, hang = 0.03, addGuide = TRUE, guideHang = 0.05)
+
+colors2num <- factor(paste0("S",1:length(unique(mergedColors))), levels=paste0("S",1:length(unique(mergedColors))))
+names(colors2num) <- unique(mergedColors)
+
+write_tsv(data.frame(EG_name=non_stat_tot_a, module=mergedColors, mod_num=colors2num[mergedColors]),
+          file=paste0(wd, "/results/tables/EG_clustringMRS"))
+
+```
+
+### Upset plot
+
+```{r upset plot}
+
+library(ggupset)
+library(ggbreak)
+
+to_upset <- (data.frame(Origin=non_stat_tot_a, module=dynamicColors, EV=EVs.dd[EVs.dd$EG_name%in%non_stat_tot_a, "value.scaled"])) %>%
+  separate(Origin, into=c("omic", "category", "subcategory", "EGnum"), sep="\\.", remove=F) %>%
+  group_by(omic, category, subcategory) %>%
+  mutate(value.sum=sum(value.scaled), EV=value.scaled/value.sum) %>%
+  mutate(EV=value.scaled)
+
+EG_order <- (to_upset %>%
+  mutate(EG_type=paste(omic, subcategory, sep=" ")) %>%
+  group_by(module) %>%
+  mutate(EG_type = list(EG_type)) %>%
+  mutate(EV_sum = max(EV)) %>%
+  ungroup() %>%
+  arrange(EV_sum) %>%
+  distinct(EG_type, EV_sum) %>%
+  dplyr::select(EV_sum, EG_type))$EV_sum
+
+sum(EG_order)
+
+upset.plot <- to_upset %>%
+  mutate(subcategory=case_when(subcategory=="a" ~ "ORF",
+                               subcategory=="C_name" ~ "pathway",
+                               subcategory=="D_name" ~ "reaction",
+                               T ~ subcategory)) %>%
+  mutate(EG_type=paste(omic, subcategory, sep=" ")) %>%
+  group_by(module) %>%
+  mutate(EG_type=list(EG_type)) %>%
+  ungroup() %>%
+  ggplot(aes(x=EG_type, y=EV)) +
+  geom_violin() +
+  stat_summary(fun.y="max", geom="point", color="red") +
+  scale_y_continuous(breaks=c(0, 2, 5, 10, 30, 60)) +
+  scale_x_upset(n_intersections=Inf, ytrans="sqrt") +
+  theme_classic()
+
+upset.plot
+
+ggsave(paste0(wd, "/results/figures/upsetMRS.png"), upset.plot, dpi=320, height=6, width=7)
+ggsave(paste0(wd, "/results/figures/upsetMRS.svg"), upset.plot, dpi=320, height=6, width=7)
+
+```
+
+### Non Stat EG comp
+
+```{r Non Stat EG comp}
+
+short_names_NonStatES <- c("ORFs",
+                           "Tax Phylum", "Tax Class", "Tax Order", "Tax Family", "Tax Genus", "Tax Species",
+                           "Fun KO", "Fun Pathway")
+names(short_names_NonStatES) <- c("raw.a",
+                                        "tax.phylum", "tax.class", "tax.order", "tax.family", "tax.genus", "tax.species",
+                                        "fun.D_name", "fun.C_name")
+
+to_upset %>%
+  group_by(omic, category, subcategory) %>%
+  mutate(count_EG=n(), EV_sum=sum(value.scaled)) %>%
+  dplyr::select(-c(EV_sum, EV)) %>%
+  ungroup() %>%
+  dplyr::select(omic, category, subcategory, value.scaled) %>%
+  pivot_longer(names_to="measure", values_to="value", -c(omic, category, subcategory)) %>%
+  mutate(Subset=paste0(category, ".", subcategory), Subset=short_names_NonStatES[Subset]) %>%
+  mutate(Subset=factor(Subset, levels=rev( c("ORFs",
+                           "Tax Phylum", "Tax Class", "Tax Order", "Tax Family", "Tax Genus", "Tax Species",
+                           "Fun KO", "Fun Pathway"))),
+         omic=factor(omic, levels=c("MG", "MT", "MP"))) %>%
+  ggplot(aes(x=Subset, y=value)) +
+  geom_bar(stat="identity") +
+  coord_flip() +
+  facet_grid(omic~measure, scales="free_x") + 
+  geom_rect(aes(xmin=-Inf, xmax=Inf, ymin=-Inf, ymax=Inf),
+            colour="black", fill=NA, inherit.aes=FALSE, size=0.5) +
+  theme_classic() +
+  theme(panel.grid.major = element_line(colour="grey", size=0.25, linetype="dashed"),
+        legend.position = "none", panel.grid.major.y = element_blank()) +
+  scale_y_continuous(expand=c(0.01, 0.01), breaks = function(x) unique(floor(pretty(seq(0, (max(x) + 1) * 1.1))))) +
+  scale_fill_viridis(discrete=T, option="viridis")
+
+```
+
+
+### rEG selection
+
+```{r rEG selection}
+
+noise.dd <- data.frame(EG_name=non_stat_tot_a, module=mergedColors, noise=colSds(abs((all.EGs[2:nrow(all.EGs),] %>% `colnames<-`(EG_names))[,non_stat_tot_a] - (all.EGs[1:(nrow(all.EGs)-1),] %>% `colnames<-`(EG_names))[,non_stat_tot_a])), EV=to_upset$EV)
+
+noise.ff <- noise.dd %>%
+  filter(!startsWith(EG_name, "MP")) %>%
+  mutate(weighted_noise=noise*(1-EV)) %>%
+  separate(EG_name, into=c("omic", "category", "subcategory", "EG_num"), sep="\\.", remove=F) %>%
+  separate(EG_num, into=c("to_delete", "EG_num"), sep="EG", remove=T) %>%
+  dplyr::select(-to_delete) %>%
+  filter(EG_num>1) %>%
+  group_by(module) %>%
+  summarise(min_noise=min(noise), rep_EG=EG_name[which(noise==min_noise)])
+
+noise.ff
+
+```
+
+### rEG Explained Variance
+
+```{r rEG Explained Variance}
+
+signals.EVs <- to_upset %>%
+  ungroup() %>%
+  mutate(module=colors2num[module]) %>%
+  dplyr::select(module, EV) %>%
+  group_by(module) %>%
+  summarise(EV=max(EV))
+
+signals.EVs
+
+sum(signals.EVs$EV)
+
+write.csv(file=paste0(wd, "/results/tables/signals_EVs.csv"), as.data.frame(signals.EVs), row.names=F)
+
+```
+
+
+### rEG plot
+
+```{r rEG plot}
+
+Sys.setenv("LANGUAGE"="En")
+Sys.setlocale("LC_ALL", "en_US.UTF-8")
+
+sampled_weeks <- as.numeric(floor(difftime(ymd(colnames(MG.raw.train.clr.corr)), ymd(colnames(MG.raw.train.clr.corr))[1], units="week"))+1)
+
+non_stat2mod <- mergedColors
+names(non_stat2mod) <- non_stat_tot_a
+
+signals.plot <- as.data.frame((all.EGs[sampled_weeks, ] %>% `colnames<-`(EG_names))[,non_stat_tot_a]) %>%
+  `rownames<-`(colnames(MG.raw.train.clr.corr)) %>%
+  rownames_to_column(var="Sample") %>%
+  pivot_longer(names_to="EG_name", values_to="value", -c(Sample)) %>%
+  mutate(module=non_stat2mod[EG_name]) %>%
+  separate(EG_name, into=c("omic", "category", "subcategory", "EG_num"), sep="\\.", remove=F) %>%
+  mutate(module=colors2num[non_stat2mod[EG_name]]) %>%
+  ggplot(aes(x=as.Date(Sample), y=value, group=EG_name)) +
+  geom_point() +
+  geom_line() +
+  facet_wrap(module~., ncol=4, scales="free") +
+  theme_classic()
+
+signals.plot
+
+ggsave(paste0(wd, "/results/figures/signals_traceMRS.png"), signals.plot, dpi=320, height=6, width=10)
+ggsave(paste0(wd, "/results/figures/signals_traceMRS.svg"), signals.plot, dpi=320, height=6, width=10)
+
+signals.plot <- as.data.frame((all.EGs[sampled_weeks, ] %>%`colnames<-`(EG_names))[,noise.ff$rep_EG]) %>%
+  `rownames<-`(colnames(MG.raw.train.clr.corr)) %>%
+  rownames_to_column(var="Sample") %>%
+  pivot_longer(names_to="EG_name", values_to="value", -Sample) %>%
+  separate(EG_name, into=c("omic", "category", "subcategory", "EG_num"), sep="\\.", remove=F) %>%
+  mutate(module=colors2num[non_stat2mod[EG_name]]) %>%
+  ggplot(aes(x=as.Date(Sample), y=value, group=EG_name)) +
+  geom_point() +
+  geom_line() +
+  facet_wrap(module~., ncol=4, scales="free_y") +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 60, hjust = 1))
+
+as.data.frame((all.EGs[sampled_weeks, ] %>% `colnames<-`(EG_names))[,noise.ff$rep_EG]) %>%
+  `rownames<-`(colnames(MG.raw.train.clr.corr)) %>%
+  rownames_to_column(var="Sample") %>%
+  pivot_longer(names_to="EG_name", values_to="value", -Sample) %>%
+  separate(EG_name, into=c("omic", "category", "subcategory", "EG_num"), sep="\\.", remove=F) %>%
+  mutate(module=colors2num[non_stat2mod[EG_name]]) %>%
+  ggplot(aes(x=as.Date(Sample), y=value, group=EG_name)) +
+  geom_point() +
+  geom_line() +
+  facet_wrap(module~., ncol=4, scales="free_y") +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 60, hjust = 1))
+
+signals.plot
+
+ggsave(paste0(wd, "/results/figures/signalsMRS.png"), signals.plot, dpi=320, height=4.5, width=10)
+ggsave(paste0(wd, "/results/figures/signalsMRS.svg"), signals.plot, dpi=320, height=4.5, width=10)
+
+```
+
+
+### Omic composition
+
+```{r, Omic composition}
+
+as.data.frame(all.EGs[sampled_weeks, ] %>%
+                `colnames<-`(EG_names)) %>%
+  `rownames<-`(colnames(MG.raw.train.clr.corr)) %>%
+  rownames_to_column(var="Sample") %>%
+  pivot_longer(names_to="EG_name", values_to="value", -Sample) %>%
+  separate(EG_name, into=c("omic", "category", "subcategory", "EG_num"), sep="\\.", remove=F) %>%
+  mutate(module=colors2num[non_stat2mod[EG_name]]) %>%
+  filter(!is.na(module)) %>%
+  dplyr::select(c("EG_name", "omic", "module")) %>%
+  distinct() %>%
+  ungroup() %>%
+  group_by(omic, module) %>%
+  summarise(n=n()) %>%
+  ungroup() %>%
+  pivot_wider(names_from=module, values_from=n) %>%
+  column_to_rownames(var="omic")
+
+```
+
+
+### Granger causality
+
+```{r, Granger causality}
+
+granger.mat <- matrix(ncol=length(noise.ff$rep_EG), nrow=length(noise.ff$rep_EG)) %>%
+  `colnames<-`(noise.ff$rep_EG) %>%
+  `rownames<-`(noise.ff$rep_EG)
+
+weeks.EGs <- as.data.frame((all.EGs[sampled_weeks, ] %>% `colnames<-`(EG_names))[,noise.ff$rep_EG])
+
+weeks.EGs[!1:nrow(all.EGs)%in%sampled_weeks, ] <- NA
+weekly_imputed <- t(impute_weekly(t(weeks.EGs), colnames(MT.raw.train.clr.corr)))
+  
+for(i in rownames(granger.mat)){
+  for(j in colnames(granger.mat)){
+    if(i != j){
+      granger.mat[i,j] <- (grangertest(weekly_imputed[,noise.ff$rep_EG][,i],
+                                       weekly_imputed[,noise.ff$rep_EG][,j],
+                                       order=10, na.action=na.omit))$`Pr(>F)`[2]
+    }
+  }
+}
+
+sum(granger.mat<0.05, na.rm=T)
+
+```
+
+### Granger causality persisten homology
+
+```{r, Granger causality persisten homology}
+
+weeks.EGs <- as.data.frame((all.EGs[sampled_weeks, ] %>% `colnames<-`(EG_names))[,noise.ff$rep_EG])
+  
+weeks.EGs[!1:nrow(all.EGs)%in%sampled_weeks, ] <- NA
+weekly_imputed <- t(impute_weekly(t(weeks.EGs), colnames(MT.raw.train.clr.corr)))
+
+for(i in rownames(granger.mat)){
+  for(j in colnames(granger.mat)){
+    if(i != j){
+      granger.mat[i,j] <- (grangertest(weekly_imputed[,noise.ff$rep_EG][,i],
+                                       weekly_imputed[,noise.ff$rep_EG][,j],
+                                       order=1, na.action=na.omit))$`Pr(>F)`[2]
+    }
+  }
+}
+
+granger.aggregate <- as.data.frame(granger.mat) %>%
+    rownames_to_column(var="Origin") %>%
+    pivot_longer(names_to="Target", values_to="lag_1", -c(Origin)) %>%
+    mutate(Origin=colors2num[non_stat2mod[Origin]], Target=colors2num[non_stat2mod[Target]])
+
+for(lag.cycle in 2:16){
+  granger.mat <- matrix(ncol=length(noise.ff$rep_EG), nrow=length(noise.ff$rep_EG)) %>%
+    `colnames<-`(noise.ff$rep_EG) %>%
+    `rownames<-`(noise.ff$rep_EG)
+    
+  for(i in rownames(granger.mat)){
+    for(j in colnames(granger.mat)){
+      if(i != j){
+        granger.mat[i,j] <- (grangertest(weekly_imputed[,noise.ff$rep_EG][,i],
+                                         weekly_imputed[,noise.ff$rep_EG][,j],
+                                         order=lag.cycle, na.action=na.omit))$`Pr(>F)`[2]
+      }
+    }
+  }
+  
+  granger.long <- as.data.frame(granger.mat) %>%
+    rownames_to_column(var="Origin") %>%
+    pivot_longer(names_to="Target", values_to=paste0("lag_", lag.cycle), -c(Origin)) %>%
+    mutate(Origin=colors2num[non_stat2mod[Origin]], Target=colors2num[non_stat2mod[Target]])
+  
+  granger.aggregate <- left_join(granger.aggregate, granger.long, by=c("Origin", "Target"))
+  
+}
+
+granger.aggregate %>%
+  filter(!is.na(lag_1)) %>%
+  pivot_longer(names_to="lags", values_to="value", -c(Origin, Target)) %>%
+  filter(value<0.05) %>%
+  ggplot(aes(y=factor(lags, levels=paste0("lag_", 1:16)), x=paste0(Origin, " ", Target), fill=value)) +
+  geom_tile() +
+  theme_classic()
+
+to_cytoscape <- granger.aggregate %>%
+  filter(!is.na(lag_1)) %>%
+  pivot_longer(names_to="lags", values_to="value", -c(Origin, Target)) %>%
+  mutate(value=ifelse(value<0.05, 1, 0), OriTar=paste0(Origin, Target), lags=factor(lags, levels=paste0("lag_", 1:16))) %>%
+  group_by(OriTar, grp=with(rle(value), rep(seq_along(lengths), lengths))) %>%
+  mutate(Counter=seq_along(grp)) %>%
+  ungroup() %>%
+  dplyr::select(-grp) %>%
+  mutate(Counter=Counter*value) %>%
+  group_by(OriTar) %>%
+  mutate(max_count=max(Counter)) %>%
+  ungroup() %>%
+  dplyr::select(-c(value, OriTar, lags, Counter)) %>%
+  filter(max_count>=6) %>%
+  distinct()
+
+dim(to_cytoscape)
+
+write_csv(to_cytoscape, paste0(wd, "/results/tables/Signal_netPH.csv"))
+
+```
+
+### Granger net
+
+```{r, Granger net}
+
+to_cytoscape <- as.data.frame(granger.mat) %>%
+  rownames_to_column(var="Origin") %>%
+  pivot_longer(names_to="Target", values_to="value", -c(Origin)) %>%
+  mutate(Origin=colors2num[non_stat2mod[Origin]], Target=colors2num[non_stat2mod[Target]]) %>%
+  filter(value<0.05)
+
+hist(to_cytoscape$value)# better with filter value>0
+
+write_csv(to_cytoscape, paste0(wd, "/results/tables/Signal_netMRS_Min.csv"))
+
+```
+
+
+### Saving image
+
+```{r, Saving image}
+
+save.image(file=paste0(wd, "/preprocessed/data_stable_MRS.RData"))
+
+```
+
+
+## EG enrichment
+
+### EG enrichment
+
+```{r EG enrichment}
+
+dd_quantile <- data.frame(omic="", mat_name="", EG_num="", direction="", name="")
+
+for(i in non_stat_tot_a){
+  splitted_cycle <- unlist(str_split(i, "\\."))
+  EG_num_cycle <- as.numeric(unlist(str_split(splitted_cycle[4], "EG"))[2])
+  if(splitted_cycle[3]=="a"){
+    names_cycle <- rownames(get(paste0(splitted_cycle[1], ".", splitted_cycle[2], ".train.clr.corr")))
+    arr_cycle <- get(paste0(splitted_cycle[1], ".", splitted_cycle[2], ".train.svd.corr"))$u[,EG_num_cycle]
+  } else {
+    names_cycle <- rownames(get(paste0(splitted_cycle[1], ".", splitted_cycle[2], ".", splitted_cycle[3], ".train.clr.corr")))
+    arr_cycle <- get(paste0(splitted_cycle[1], ".", splitted_cycle[2], ".", splitted_cycle[3], ".train.svd.corr"))$u[,EG_num_cycle]
+  }
+  names(arr_cycle) <- names_cycle
+  
+  if(splitted_cycle[3]=="a"){ 
+    print("skip")
+  } else {
+    
+    if(splitted_cycle[2]=="tax"){
+      count_dd <- LAO_tax %>%
+        group_by_at(c(splitted_cycle[3], "ORF")) %>% summarise() %>%
+        group_by_at(c(splitted_cycle[3])) %>% summarise(n=n())
+      tab_abundance <- unlist(count_dd[,2])
+      names(tab_abundance) <- unlist(count_dd[,1])
+      arr_cycle <- arr_cycle[names(tab_abundance[tab_abundance>500])]
+    }
+    
+    if(splitted_cycle[2]=="fun"){
+      count_dd <- LAO_ko %>%
+        group_by_at(c(splitted_cycle[3], "ORF")) %>% summarise() %>%
+        group_by_at(c(splitted_cycle[3])) %>% summarise(n=n())
+      tab_abundance <- unlist(count_dd[,2])
+      names(tab_abundance) <- unlist(count_dd[,1])
+      arr_cycle <- arr_cycle[names(tab_abundance[tab_abundance>20])]
+    }
+    
+    up_cycle <- sort(arr_cycle[arr_cycle>quantile(arr_cycle, c(0.95), na.rm=T)], decreasing=T)
+    down_cycle <- sort(arr_cycle[arr_cycle<quantile(arr_cycle, c(0.05), na.rm=T)], decreasing=F)
+    
+    up_n <- length(up_cycle)
+    down_n <- length(down_cycle)
+    
+    up_mat <- data.frame(omic=rep(splitted_cycle[1], up_n), mat_name=rep(paste0(splitted_cycle[2], ".", splitted_cycle[3]), up_n), EG_num=rep(splitted_cycle[4], up_n), direction=rep("up", up_n), name=names(up_cycle))
+    down_mat <- data.frame(omic=rep(splitted_cycle[1], down_n), mat_name=rep(paste0(splitted_cycle[2], ".", splitted_cycle[3]), down_n), EG_num=rep(splitted_cycle[4], down_n), direction=rep("down", down_n), name=names(down_cycle))
+    
+    dd_quantile <- rbind(dd_quantile, rbind(up_mat, down_mat))
+    
+  }
+}
+
+dd_quantile <- dd_quantile[2:nrow(dd_quantile),]
+
+dd_extra <- left_join((dd_quantile %>% `colnames<-`(c("omic", "mat_name", "EGnum", "direction", "D_name"))),
+                       (map_ko %>% dplyr::select(D_name, C_name, B_name)))
+
+write_tsv(dd_quantile, paste0(wd, "/results/tables/EGs_percentilesMRS.tsv"))
+
+```

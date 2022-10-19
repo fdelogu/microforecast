@@ -1,0 +1,1936 @@
+---
+title: "LAO analysis, prediction and validation"
+author: "Francesco Delogu"
+date: as.Date(now())
+output: html_document
+---
+
+# Analysis of LAO, prediction and validation of future samples
+
+## Set the environment
+
+```{r setup}
+
+options(stringsAsFactors = F, gsubfn.engine = "R")
+
+Sys.setenv("LANGUAGE"="En")
+
+library(tidyverse)
+library(matrixStats)
+library(ggridges)
+library(compositions)
+library(MASS)
+library(caret)
+library(lubridate)
+library(imputeTS)
+library(parallel)
+library(tseries)
+library(forecast)
+library(olsrr)
+library(fable)
+library(viridis)
+library(TidyMultiqc)
+library(GSEABase)
+library(AnnotationDbi)
+library(ggnewscale)
+library(WGCNA)
+library(GOstats)
+library(lmtest)
+
+wd <- getwd()
+
+```
+
+
+## Load data
+
+### Load counts
+
+```{r load counts}
+
+load(paste0(wd, "/preprocessed/data_stable_MRS.RData"))
+
+```
+
+
+### Load functional annotation
+
+```{r load functional annotation}
+
+LAO_ko <- read_tsv(paste0(wd, "/data/mantis_integrated.kofam"), col_names=c("ORF", "D_code"))
+
+map_ko <- read_tsv(paste0(wd, "/data/ko.txt"))
+LAO_ko <- inner_join(LAO_ko, map_ko)
+
+LAO_samples <- read.table(paste0(wd, "/data/samples.txt"), sep=" ", header=T)
+sample_to_date <- as.Date(LAO_samples$Date)
+names(sample_to_date) <- LAO_samples$Sample
+
+LAO_meta <- read_tsv(paste0(wd, "/data/LAO_metadata.tsv"))
+colnames(LAO_meta) <- c("Date", colnames(LAO_meta)[2:length(colnames(LAO_meta))])
+LAO_meta$Date <- as.Date(LAO_meta$Date, "%m/%d/%y")
+LAO_meta$Oxygen_manual <- as.numeric(LAO_meta$Oxygen_manual)
+LAO_meta$Oxygen_sat_manual <- as.numeric(LAO_meta$Oxygen_sat_manual)
+LAO_meta$Time[is.na(LAO_meta$Time)] <- median(LAO_meta$Time, na.rm=T)
+LAO_meta <- LAO_meta %>%
+  mutate(DateTime = ymd_hms(paste(LAO_meta$Date, LAO_meta$Time, sep=" ")))
+
+Sivec_meta <- read_tsv(paste0(wd, "/data/Sivec_Schifflange.csv"))
+Sivec_meta$Date <- as.Date(Sivec_meta$Date, "%m/%d/%y")
+Sivec_meta <- Sivec_meta %>%
+  mutate(DateTime = ymd_h(paste(Sivec_meta$Date, Sivec_meta$Time, sep=" ")),
+         Time = paste0(Time, ":00:00"))
+
+```
+
+
+### Load taxonomical annotation
+
+```{r load taxonomical annotation}
+
+gene.map <- read_tsv(paste0(wd, "/data/gene.map5plus"), col_names=F) %>%
+  `colnames<-`(c("ORF", "contig", "subset"))
+
+bin.tax <- read_tsv(paste0(wd, "/data/out.BAT.classification")) %>%
+  `colnames<-`(c("bin", colnames(.)[-1])) %>%
+  separate(superkingdom, c("superkingdom", "to_delete"), sep=":") %>%
+  separate(phylum, c("phylum", "to_delete"), sep=":") %>%
+  separate(class, c("class", "to_delete"), sep=":") %>%
+  separate(order, c("order", "to_delete"), sep=":") %>%
+  separate(family, c("family", "to_delete"), sep=":") %>%
+  separate(genus, c("genus", "to_delete"), sep=":") %>%
+  separate(species, c("species", "to_delete"), sep=":") %>%
+  dplyr::select(-to_delete, -lineage, -`lineage scores`, -reason, -classification)
+
+bin.map <- read_tsv(paste0(wd, "/data/bin_summary.txt"), col_names=F) %>%
+  `colnames<-`(c("contig", "bin"))
+
+contig.tax <- read_tsv(paste0(wd, "/data/out.CAT2.classification")) %>%
+  `colnames<-`(c("contig", colnames(.)[-1])) %>%
+  separate(superkingdom, c("superkingdom", "to_delete"), sep=":") %>%
+  separate(phylum, c("phylum", "to_delete"), sep=":") %>%
+  separate(class, c("class", "to_delete"), sep=":") %>%
+  separate(order, c("order", "to_delete"), sep=":") %>%
+  separate(family, c("family", "to_delete"), sep=":") %>%
+  separate(genus, c("genus", "to_delete"), sep=":") %>%
+  separate(species, c("species", "to_delete"), sep=":") %>%
+  dplyr::select(-to_delete, -lineage, -`lineage scores`, -reason)
+
+contig.bin.tax <- full_join(bin.map, bin.tax)
+rm(bin.tax, bin.map)
+
+euk.bin.tax <- read_tsv(paste0(wd, "/data/euk.BAT.classification")) %>%
+  `colnames<-`(c("bin", colnames(.)[-1])) %>%
+  separate(superkingdom, c("superkingdom", "to_delete"), sep=":") %>%
+  separate(phylum, c("phylum", "to_delete"), sep=":") %>%
+  separate(class, c("class", "to_delete"), sep=":") %>%
+  separate(order, c("order", "to_delete"), sep=":") %>%
+  separate(family, c("family", "to_delete"), sep=":") %>%
+  separate(genus, c("genus", "to_delete"), sep=":") %>%
+  separate(species, c("species", "to_delete"), sep=":") %>%
+  dplyr::select(-to_delete, -lineage, -`lineage scores`, -reason, -classification)
+
+euk.bin.map <- read_tsv(paste0(wd, "/data/euk_summary.txt"), col_names=F) %>%
+  `colnames<-`(c("contig", "bin"))
+
+euk.tax <- read_tsv(paste0(wd, "/data/euk_tax.tsv"), col_names=F) %>%
+  `colnames<-`(c("contig", "to_delete", "to_delete", "to_delete", "to_delete", "to_delete", "to_delete", "to_delete", "tax")) %>%
+  dplyr::select(-to_delete) %>%
+  separate(tax, c("superkingdom", "phylum", "class", "order", "family", "genus", "species"), sep=";") %>%
+  separate(superkingdom, c("to_delete", "superkingdom"), sep="_") %>%
+  separate(phylum, c("to_delete", "phylum"), sep="_") %>%
+  separate(class, c("to_delete", "class"), sep="_") %>%
+  separate(order, c("to_delete", "order"), sep="_") %>%
+  separate(family, c("to_delete", "family"), sep="_") %>%
+  separate(genus, c("to_delete", "genus"), sep="_") %>%
+  separate(species, c("to_delete", "species"), sep="_") %>%
+  dplyr::select(-to_delete)
+
+euk.contig.bin.tax <- full_join(euk.bin.map, euk.bin.tax)
+rm(euk.bin.tax, euk.bin.map)
+
+
+all.contigs.tax <- rbind(contig.bin.tax,
+                         euk.contig.bin.tax,
+                         (contig.tax %>% mutate(bin="unbinned"))[,colnames(contig.bin.tax)],
+                         (euk.tax %>% mutate(bin="unbinned"))[,colnames(contig.bin.tax)])
+rm(contig.bin.tax, contig.tax,
+   euk.contig.bin.tax, euk.tax)
+
+LAO_tax <- full_join(gene.map, all.contigs.tax, by="contig")
+rm(gene.map, all.contigs.tax)
+
+```
+
+
+## EG enrichment
+
+### EG enrichment
+
+```{r EG enrichment}
+
+dd_quantile <- read_tsv(paste0(wd, "/results/tables/EGs_percentilesMRS.tsv"))
+
+dd_extra <- left_join((dd_quantile %>% `colnames<-`(c("omic", "mat_name", "EGnum", "direction", "D_name"))),
+                       (map_ko %>% dplyr::select(D_name, C_name, B_name)))
+
+```
+
+### EG Alignment to signal
+
+```{r EG enrichment}
+
+signals.dd <- as.data.frame((all.EGs[sampled_weeks, ] %>% `colnames<-`(EG_names))[,non_stat_tot_a]) %>%
+    `rownames<-`(colnames(MG.raw.train.clr.corr)) %>%
+    rownames_to_column(var="Sample") %>%
+    pivot_longer(names_to="EG_name", values_to="value", -c(Sample)) %>%
+    mutate(module=non_stat2mod[EG_name]) %>%
+    separate(EG_name, into=c("omic", "category", "subcategory", "EG_num"), sep="\\.", remove=F) %>%
+    mutate(module=colors2num[non_stat2mod[EG_name]]) %>%
+    filter(EG_name%in%unique(noise.ff$rep_EG))
+  
+  signals.mat <- (signals.dd %>%
+      pivot_wider(id_cols=Sample, names_from=module, values_from=value) %>%
+      column_to_rownames("Sample"))[,names(table(signals.dd$module))]
+
+
+head(dd_quantile)
+
+quantile_aligned <- dd_quantile %>%
+  mutate(EG_name=paste0(omic, ".", mat_name, ".", EG_num),
+         mod=colors2num[non_stat2mod[EG_name]]) %>%
+  rowwise() %>%
+  mutate(Sign=sign((cor.test(as.numeric(all.EGs[sampled_weeks, EG_names==EG_name]), as.numeric(signals.mat[, mod])))$estimate),
+         direction=ifelse(direction=="up", 1, -1),
+         direction=direction*Sign,
+         direction=ifelse(direction==1, "up", "down")) %>%
+  dplyr::select(-Sign)
+
+head(quantile_aligned)
+
+write_tsv(quantile_aligned, paste0(wd, "/results/tables/EGs_percentiles_alignedMRS.tsv"))
+
+```
+
+
+### Summarize quantiles
+
+```{r Summarize quantiles}
+
+CD_conversion <- c(map_ko$C_name)
+names(CD_conversion) <- map_ko$D_name
+
+shape_lgnd <- c(24, 25)
+names(shape_lgnd) <- c("up", "down")
+color_lgnd <- c("darkgreen", "darkred")
+names(color_lgnd) <- c("up", "down")
+
+pathway.loadings.plot <- quantile_aligned %>%
+  filter(mat_name%in%c("fun.C_name", "fun.D_name")) %>%
+  mutate(C_name=ifelse(mat_name=="fun.D_name",
+                CD_conversion[name],
+                name)) %>%
+  group_by(mod, C_name, omic, direction) %>%
+  summarise(n=n(), .groups="keep") %>%
+  arrange(desc(n)) %>%
+  filter(n>3) %>%
+  ggplot(aes(x=mod, y=factor(C_name, levels=rev(sort(unique(C_name)))))) +
+  geom_point(aes(shape=direction, color=direction), position=position_dodge(width=0.3)) +
+  scale_shape_manual(values=shape_lgnd) +
+  scale_color_manual(values=color_lgnd) +
+  facet_grid(.~factor(omic, levels=c("MG", "MT", "MP")), scales="free") +
+  theme_minimal() +
+  theme(panel.spacing = unit(.05, "lines"),
+        panel.border = element_rect(color = "black", fill = NA, size = 1), 
+        strip.background = element_rect(color = "black", size = 1)) +
+  theme(axis.text.x = element_text(angle=300, vjust=0.5, hjust=0.2)) +
+  labs(x="Signal", y="Pathway")
+
+lipid.loadings.plot <- inner_join((quantile_aligned %>%
+                           filter(mat_name%in%c("fun.D_name")) %>%
+                             mutate(D_name=name)),
+                        (map_ko %>%
+                           dplyr::select(D_name, C_name, D_code))) %>%
+  filter(C_name%in%c("Fatty acid biosynthesis", "Fatty acid elongation", "Fatty acid degradation",
+                     "Glycerolipid metabolism", "Glycerophospholipid metabolism", "Biosynthesis of unsaturated fatty acids")) %>%
+  mutate(name=D_code) %>%
+  group_by(mod, C_name, name, omic, direction) %>%
+  summarise(n=n(), .groups="keep") %>%
+  arrange(desc(n)) %>%
+  filter(n>0) %>%
+  ggplot(aes(x=mod, y=factor(name, levels=rev(sort(unique(name)))))) +
+  geom_point(aes(shape=direction, color=direction), position=position_dodge(width=0.3)) +
+  scale_shape_manual(values=shape_lgnd) +
+  scale_color_manual(values=color_lgnd) +
+  facet_grid(C_name~factor(omic, levels=c("MG", "MT", "MP")), scales="free", space="free") +
+  theme_minimal() +
+  theme(panel.spacing = unit(.05, "lines"),
+        panel.border = element_rect(color = "black", fill = NA, size = 1), 
+        strip.background = element_rect(color = "black", size = 1)) +
+  theme(axis.text.x = element_text(angle=300, vjust=0.5, hjust=0.2)) +
+  labs(x="Signal", y="Pathway")
+
+unique(b$D_code)
+ggsave(paste0(wd, "/results/figures/lipid_loadings.png"), lipid.loadings.plot, dpi=320, height=8, width=6)
+
+species.loadings.plot <- quantile_aligned %>%
+  filter(mat_name%in%c("tax.species")) %>%
+  mutate(name=name) %>%
+  group_by(mod, name, omic, direction) %>%
+  summarise(n=n(), .groups="keep") %>%
+  arrange(desc(n)) %>%
+  filter(n>0) %>%
+  ggplot(aes(x=mod, y=factor(name, levels=rev(sort(unique(name)))))) +
+  geom_point(aes(shape=direction, color=direction), position=position_dodge(width=0.3)) +
+  scale_shape_manual(values=shape_lgnd) +
+  scale_color_manual(values=color_lgnd) +
+  facet_grid(.~factor(omic, levels=c("MG", "MT", "MP")), scales="free") +
+  theme_minimal() +
+  theme(panel.spacing = unit(.05, "lines"),
+        panel.border = element_rect(color = "black", fill = NA, size = 1), 
+        strip.background = element_rect(color = "black", size = 1)) +
+  theme(axis.text.x = element_text(angle=300, vjust=0.5, hjust=0.2)) +
+  labs(x="Signal", y="Species")
+
+speciesgenus_conversion <- c((LAO_tax %>% dplyr::select(species, genus))$genus)
+names(speciesgenus_conversion) <- c((LAO_tax %>% dplyr::select(species, genus))$species)
+
+genus.loadings.plot <- quantile_aligned %>%
+  filter(mat_name%in%c("tax.species", "tax.genus")) %>%
+  mutate(name=ifelse(mat_name=="tax.species", speciesgenus_conversion[name], name)) %>%
+  group_by(mod, name, omic, direction) %>%
+  summarise(n=n(), .groups="keep") %>%
+  arrange(desc(n)) %>%
+  filter(n>0) %>%
+  ggplot(aes(x=mod, y=factor(name, levels=rev(sort(unique(name)))))) +
+  geom_point(aes(shape=direction, color=direction), position=position_dodge(width=0.3)) +
+  scale_shape_manual(values=shape_lgnd) +
+  scale_color_manual(values=color_lgnd) +
+  facet_grid(.~factor(omic, levels=c("MG", "MT", "MP")), scales="free") +
+  theme_minimal() +
+  theme(panel.spacing = unit(.05, "lines"),
+        panel.border = element_rect(color = "black", fill = NA, size = 1), 
+        strip.background = element_rect(color = "black", size = 1)) +
+  theme(axis.text.x = element_text(angle=300, vjust=0.5, hjust=0.2)) +
+  labs(x="Signal", y="Genus")
+
+speciesfamily_conversion <- c((LAO_tax %>% dplyr::select(species, family))$family)
+names(speciesfamily_conversion) <- c((LAO_tax %>% dplyr::select(species, family))$species)
+genusfamily_conversion <- c((LAO_tax %>% dplyr::select(genus, family))$family)
+names(genusfamily_conversion) <- c((LAO_tax %>% dplyr::select(genus, family))$genus)
+
+selected.families <- unique(c(names(sort(rowMeans(MG.tax.family.train.clr.corr), decreasing=T)[1:35]),
+                              names(sort(rowMeans(MT.tax.family.train.clr.corr), decreasing=T)[1:35]),
+                              names(sort(rowMeans(MP.tax.family.train.clr.corr), decreasing=T)[1:35])))
+
+short_superkingdom <- c("A.", "Bacteria", "V.")
+names(short_superkingdom) <- c("Archaea", "Bacteria", "Viruses")
+familysuperkingdom_conversion <- short_superkingdom[c((LAO_tax %>% dplyr::select(family, superkingdom))$superkingdom)]
+names(familysuperkingdom_conversion) <- c((LAO_tax %>% dplyr::select(family, superkingdom))$family)
+familysuperkingdom_conversion <- familysuperkingdom_conversion[!is.na(names(familysuperkingdom_conversion))]
+
+family.loadings.plot <- quantile_aligned %>%
+  filter(mat_name%in%c("tax.species", "tax.genus", "tax.family")) %>%
+  mutate(name=ifelse(mat_name=="tax.species", speciesfamily_conversion[name], name),
+         name=ifelse(mat_name=="tax.genus", genusfamily_conversion[name], name),
+         superkingdom=familysuperkingdom_conversion[name]) %>%
+  filter(!is.na(name), name!="not classified", name%in%selected.families) %>%
+  group_by(mod, name, omic, direction, superkingdom) %>%
+  summarise(n=n(), .groups="keep") %>%
+  arrange(desc(n)) %>%
+  filter(n>0) %>%
+  ggplot(aes(x=mod, y=factor(name, levels=rev(sort(unique(name)))))) +
+  geom_point(aes(shape=direction, color=direction), position=position_dodge(width=0.3)) +
+  scale_shape_manual(values=shape_lgnd) +
+  scale_color_manual(values=color_lgnd) +
+  facet_grid(superkingdom~factor(omic, levels=c("MG", "MT", "MP")), scales="free", space="free") +
+  theme_minimal() +
+  theme(panel.spacing = unit(.05, "lines"),
+        panel.border = element_rect(color = "black", fill = NA, size = 1), 
+        strip.background = element_rect(color = "black", size = 1)) +
+  theme(axis.text.x = element_text(angle=300, vjust=0.5, hjust=0.2)) +
+  labs(x="Signal", y="Family")
+
+KO.sub <- c("K03621", "K06117", "K00864", "K08591", "K13507", "K00631", "K00655", "K13509", "K13513", "K14674",
+            "K07029", "K01054", "K01046", "K14674", "K01046", "K22848",
+            "K00981", "K17103", "K01613", "K00570", "K00570", "K01114")
+
+ko.loadings.plot <- inner_join((quantile_aligned %>%
+                           filter(mat_name%in%c("fun.D_name")) %>%
+                             mutate(D_name=name)),
+                        (map_ko %>%
+                           dplyr::select(D_name, C_name, D_code))) %>%
+  filter(D_code%in%KO.sub) %>%
+  mutate(name=D_code) %>%
+  group_by(mod, C_name, name, omic, direction) %>%
+  summarise(n=n(), .groups="keep") %>%
+  arrange(desc(n)) %>%
+  filter(n>0) %>%
+  ggplot(aes(x=mod, y=factor(name, levels=rev(sort(unique(name)))))) +
+  geom_point(aes(shape=direction, color=direction)) +
+  scale_shape_manual(values=shape_lgnd) +
+  scale_color_manual(values=color_lgnd) +
+  facet_grid(.~factor(omic, levels=c("MG", "MT", "MP")), scales="free", space="free") +
+  theme_minimal() +
+  theme(panel.spacing = unit(.05, "lines"),
+        panel.border = element_rect(color = "black", fill = NA, size = 1), 
+        strip.background = element_rect(color = "black", size = 1)) +
+  theme(axis.text.x = element_text(angle=300, vjust=0.5, hjust=0.2)) +
+  labs(x="Signal", y="Pathway")
+
+ggsave(paste0(wd, "/results/figures/ko_loadings.png"), ko.loadings.plot, dpi=320, height=2, width=3)
+ggsave(paste0(wd, "/results/figures/ko_loadings.svg"), ko.loadings.plot, dpi=320, height=2, width=3)
+
+ggsave(paste0(wd, "/results/figures/pathway_loadings.png"), pathway.loadings.plot, dpi=320, height=7, width=8)
+ggsave(paste0(wd, "/results/figures/pathway_loadings.svg"), pathway.loadings.plot, dpi=320, height=7, width=8)
+
+ggsave(paste0(wd, "/results/figures/species_loadings.png"), species.loadings.plot, dpi=320, height=8, width=12)
+ggsave(paste0(wd, "/results/figures/species_loadings.svg"), species.loadings.plot, dpi=320, height=8, width=12)
+
+ggsave(paste0(wd, "/results/figures/genus_loadings.png"), genus.loadings.plot, dpi=320, height=8, width=12)
+ggsave(paste0(wd, "/results/figures/genus_loadings.svg"), genus.loadings.plot, dpi=320, height=8, width=12)
+
+ggsave(paste0(wd, "/results/figures/family_loadings.png"), family.loadings.plot, dpi=320, height=6, width=7)
+ggsave(paste0(wd, "/results/figures/family_loadings.svg"), family.loadings.plot, dpi=320, height=6, width=7)
+
+```
+
+### Tax focus on lipids
+
+```{r Tax composition per block}
+
+ko.tax.sub <- inner_join(LAO_ko %>%
+             filter(C_name%in%c("Fatty acid biosynthesis", "Fatty acid elongation", "Fatty acid degradation",
+                     "Glycerolipid metabolism", "Glycerophospholipid metabolism", "Biosynthesis of unsaturated fatty acids")),
+           LAO_tax) %>%
+  mutate(family=ifelse(subset=="plasmid", "plasmid", family),
+         family=ifelse(is.na(family), "not classified", family)) %>%
+  dplyr::select(ORF, C_name, D_code, family)
+
+```
+
+### Load counts
+
+```{r load counts}
+
+MG.raw <- (read_tsv(paste0(wd, "/data/MG_harmonized.tsv")) %>%
+  column_to_rownames(var="ORF"))[ko.tax.sub$ORF,]
+
+MT.raw <- (read_tsv(paste0(wd, "/data/MT_harmonized.tsv")) %>%
+  column_to_rownames(var="ORF"))[ko.tax.sub$ORF,]
+
+MP.raw <- exp((read_tsv(paste0(wd, "/data/summary_prophane.tsv")) %>%
+  mutate(ORF=gsub("Good", "", gsub(";", "+", members_identifier))) %>%
+  dplyr::select(-members_identifier) %>%
+  column_to_rownames(var="ORF")))
+div.factor <- unlist(lapply(str_split(rownames(MP.raw), "\\+"), length))
+MP.raw <- t(t(MP.raw)/div.factor)
+MP.raw <- as.data.frame(MP.raw) %>%
+  rownames_to_column("ORF") %>%
+  separate_rows(ORF, sep="\\+") %>%
+  column_to_rownames(var="ORF")
+MP.raw <- MP.raw[rownames(MP.raw)%in%ko.tax.sub$ORF,]
+
+```
+
+### Tax per block
+
+```{r Tax per block}
+
+lipid.sub <- inner_join((quantile_aligned %>%
+                           filter(mat_name%in%c("fun.D_name")) %>%
+                             mutate(D_name=name)),
+                        (map_ko %>%
+                           dplyr::select(D_name, C_name, D_code))) %>%
+  filter(C_name%in%c("Fatty acid biosynthesis", "Fatty acid elongation", "Fatty acid degradation",
+                     "Glycerolipid metabolism", "Glycerophospholipid metabolism", "Biosynthesis of unsaturated fatty acids")) %>%
+  mutate(name=D_code) %>%
+  group_by(mod, C_name, name, omic, direction) %>%
+  summarise(n=n(), .groups="keep") %>%
+  arrange(desc(n)) %>%
+  filter(n>0)
+
+to_plot <- rbind((inner_join((exp(MG.raw[,1:51]) %>%
+             rownames_to_column("ORF")),
+           ko.tax.sub) %>%
+  filter(C_name%in%c("Fatty acid biosynthesis", "Fatty acid elongation", "Fatty acid degradation",
+                     "Glycerolipid metabolism", "Glycerophospholipid metabolism", "Biosynthesis of unsaturated fatty acids")) %>%
+  group_by(D_code, C_name, family) %>%
+  summarise_at(vars(-ORF), sum) %>%
+  pivot_longer(names_to="sample", values_to="value", -c(D_code, C_name, family)) %>%
+  group_by(D_code, C_name, family) %>%
+  summarise(m=median(value), .groups="keep") %>%
+  ungroup() %>%
+  group_by(D_code) %>% 
+  mutate(s=sum(m)) %>%
+  ungroup() %>%
+  group_by(D_code, C_name, family) %>%
+  mutate(perc=(m/s)*100) %>%
+  filter(perc>0, m>5, s>10) %>%
+  mutate(omic="MG")),
+  (inner_join((exp(MT.raw[,1:51]) %>%
+             rownames_to_column("ORF")),
+           ko.tax.sub) %>%
+  filter(C_name%in%c("Fatty acid biosynthesis", "Fatty acid elongation", "Fatty acid degradation",
+                     "Glycerolipid metabolism", "Glycerophospholipid metabolism", "Biosynthesis of unsaturated fatty acids")) %>%
+  group_by(D_code, C_name, family) %>%
+  summarise_at(vars(-ORF), sum) %>%
+  pivot_longer(names_to="sample", values_to="value", -c(D_code, C_name, family)) %>%
+  group_by(D_code, C_name, family) %>%
+  summarise(m=median(value), .groups="keep") %>%
+  ungroup() %>%
+  group_by(D_code) %>%
+  mutate(s=sum(m)) %>%
+  ungroup() %>%
+  group_by(D_code, C_name, family) %>%
+  mutate(perc=(m/s)*100) %>%
+  filter(perc>5, m>5, s>10) %>%
+  mutate(omic="MT")),
+  (inner_join(((MP.raw[,1:51]) %>%
+             rownames_to_column("ORF")),
+           ko.tax.sub) %>%
+  filter(C_name%in%c("Fatty acid biosynthesis", "Fatty acid elongation", "Fatty acid degradation",
+                     "Glycerolipid metabolism", "Glycerophospholipid metabolism", "Biosynthesis of unsaturated fatty acids")) %>%
+  group_by(D_code, C_name, family) %>%
+  summarise_at(vars(-ORF), sum) %>%
+  pivot_longer(names_to="sample", values_to="value", -c(D_code, C_name, family)) %>%
+  group_by(D_code, C_name, family) %>%
+  summarise(m=median(value), .groups="keep") %>%
+  ungroup() %>%
+  group_by(D_code) %>% 
+  mutate(s=sum(m)) %>%
+  ungroup() %>%
+  group_by(D_code, C_name, family) %>%
+  mutate(perc=(m/s)*100) %>%
+  filter(perc>5, m>=1, s>=1) %>%
+  mutate(omic="MP")))
+
+KO.sub <- c("K03621", "K06117", "K00864", "K08591", "K13507", "K00631", "K00655", "K13509", "K13513", "K14674",
+            "K07029", "K01054", "K01046", "K14674", "K01046", "K22848",
+            "K00981", "K17103", "K01613", "K00570", "K00570", "K01114")
+ 
+to_plot %>%
+  filter(C_name%in%c("Glycerolipid metabolism")) %>%
+  ggplot(aes(x=D_code, y=m, fill=family)) +
+  geom_bar(stat="identity") +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 60, hjust=1)) +
+  scale_y_log10() +
+  facet_grid(C_name~factor(omic, levels=c("MG", "MT", "MP")), scale="free", space="free", drop=T) +
+  coord_flip()
+
+to_plot %>%
+  filter(C_name%in%c("Glycerophospholipid metabolism")) %>%
+  ggplot(aes(x=D_code, y=m, fill=family)) +
+  geom_bar(stat="identity") +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 60, hjust=1)) +
+  scale_y_log10() +
+  facet_grid(C_name~factor(omic, levels=c("MG", "MT", "MP")), scale="free", space="free", drop=T) +
+  coord_flip()
+
+KO.sub.plot <- to_plot %>%
+  mutate(Family=family) %>%
+  filter(D_code%in%KO.sub) %>%
+  ggplot(aes(x=D_code, y=m, fill=Family)) +
+  geom_bar(stat="identity") +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 60, hjust=1),
+        panel.border = element_rect(fill=NA, size=1)) +
+  scale_y_log10(expand=c(0,0), breaks=c(1, 1e+3, 1e+6, 1e+9, 1e+12, 1e+15, 1e+18, 1e+21)) +
+  facet_grid(.~factor(omic, levels=c("MG", "MT", "MP")), scale="free", space="free", drop=T) +
+  coord_flip() +
+  labs(x="KO term", y="log10(Abundance)")
+  
+KO.sub.plot
+
+ggsave(paste0(wd, "/results/figures/KO.sub.png"), KO.sub.plot, dpi=320, height=6, width=6)
+ggsave(paste0(wd, "/results/figures/KO.sub.svg"), KO.sub.plot, dpi=320, height=6, width=6)
+
+```
+
+
+## ARIMA modelling and process generation
+
+### Fitting funtions
+
+```{r Fitting functions}
+
+arima_cycle0 <- function(ts.train, ts.test, target, predictors){
+  
+  to_return1 <- ts.train %>%
+    model(ari = ARIMA(as.formula(paste(target, paste0(c(predictors), collapse="+"), sep="~")),
+                                 approximation=T, stepwise=T)) 
+  to_return2 <- to_return1 %>%
+    forecast(new_data = ts.test)
+  
+  return(list(just.model=to_return1, pred.model=to_return2))
+}
+
+arima_cycleN <- function(ts.train, ts.test, target, predictors, N){
+  
+  to_return1 <- ts.train %>%
+    model(ari = ARIMA(as.formula(paste(target, paste0(c(predictors, paste0("fourier(K=", N, ")")), collapse="+"), sep="~")),
+                                 approximation=T, stepwise=T)) 
+  to_return2 <- to_return1 %>%
+    forecast(new_data = ts.test)
+  
+  return(list(just.model=to_return1, pred.model=to_return2))
+}
+
+eval_model <- function(dd, real.value, pred.value){
+  
+  to_return <- dd %>%
+    filter(!is.na(real.value)) %>%
+    mutate(res=(real.value-pred.value)**2) %>%
+    mutate(date=as.Date(date)) %>%
+    mutate(Group=case_when(date<"2012-06-01"~"Train",
+                           date>"2012-05-31" & date<"2013-05-31"~"Test2012",
+                           date>"2013-05-31" & date<"2014-05-31"~"Test2013",
+                           date>"2014-05-31" & date<"2015-05-31"~"Test2014",
+                           date>"2015-05-31" & date<"2016-05-31"~"Test2015",
+                           date>"2016-05-31" & date<"2017-05-31"~"Test2016")) %>%
+  group_by(Group) %>%
+  summarise(n=n(), res=sum(res, na.rm=T), SST=var(.[.$Group=="Train","real.value"], na.rm=T)*(n), Rsq=1-res/SST) %>%
+  ungroup() %>%
+  dplyr::select(Group, Rsq) %>%
+  as.data.frame()
+  
+  return(to_return)
+  
+}
+
+
+eval_model_weighted <- function(dd, real.value, pred.value, weight){
+  
+  to_return <- dd %>%
+    filter(!is.na(real.value)) %>%
+    mutate(res=(real.value-pred.value)**2) %>%
+    mutate(date=as.Date(date)) %>%
+    mutate(Group=case_when(date<"2012-06-01"~"Train",
+                           date>"2012-05-31" & date<"2013-05-31"~"Test2012",
+                           date>"2013-05-31" & date<"2014-05-31"~"Test2013",
+                           date>"2014-05-31" & date<"2015-05-31"~"Test2014",
+                           date>"2015-05-31" & date<"2016-05-31"~"Test2015",
+                           date>"2016-05-31" & date<"2017-05-31"~"Test2016")) %>%
+  group_by(Group) %>%
+  summarise(n=n(), res=sum(res, na.rm=T), SST=var(.[.$Group=="Train","real.value"], na.rm=T)*(n), Rsq=1-res/SST) %>%
+  ungroup() %>%
+  dplyr::select(Group, Rsq) %>%
+  as.data.frame()
+  
+  print("Unweighted")
+  print(to_return[to_return$Group=="Train", "Rsq"])
+  
+  to_return <- to_return %>%
+    mutate(Rsq=Rsq-(abs(Rsq)*(1-(1/(1+exp((weight)-5))))))
+  
+  print("Weighted")
+  print(to_return[to_return$Group=="Train", "Rsq"])
+  
+  return(to_return)
+  
+}
+
+arima_cycles2 <- function(ts.train, ts.test, ts.val, target, predictors, N){
+
+  cycle_counter <- 0
+  scores <- rep(-1000, N+1)
+  models <- list()
+  predictions <- list()
+
+  while(cycle_counter<=N){
+    print(cycle_counter)
+
+    if(cycle_counter==0){
+
+      pred.model <- arima_cycle0(ts.train, ts.test, target, predictors)
+      models[[cycle_counter+1]] <- pred.model[[1]]
+      predictions[[cycle_counter+1]] <- pred.model[[2]]
+      dd <- full_join(data.frame(date=pred.model[[2]]$date, pred.value=mean(pred.model[[2]]$value, na.rm=T)),
+                               ts.val)
+      pred.score <- eval_model(dd, real.value, pred.value)
+      scores[[cycle_counter+1]] <- as.numeric(pred.score[pred.score$Group=="Train", "Rsq"])
+
+    } else {
+
+      pred.model <- arima_cycleN(ts.train, ts.test, target, predictors, cycle_counter)
+      models[[cycle_counter+1]] <- pred.model[[1]]
+      predictions[[cycle_counter+1]] <- pred.model[[2]]
+      dd <- full_join(data.frame(date=pred.model[[2]]$date, pred.value=mean(pred.model[[2]]$value, na.rm=T)),
+                               ts.val)
+      pred.score <- eval_model(dd, real.value, pred.value)
+      scores[[cycle_counter+1]] <- as.numeric(pred.score[pred.score$Group=="Train", "Rsq"])
+    }
+    
+    print("Here")
+    print(scores[cycle_counter + 1])
+    cycle_counter <- cycle_counter + 1
+  
+  }
+
+  print(scores)
+
+  return(list(pred.model=predictions[match(max(scores), scores)],
+         just.model=models[match(max(scores), scores)]))
+
+}
+
+```
+
+```{r filtering functions}
+
+get_interpolated_Sivec <- function(dd, datetime){
+  for(i in datetime){
+    if(!(i %in% dd$DateTime)){
+      lower <- max(dd$DateTime[dd$DateTime<i])
+      upper <- min(dd$DateTime[dd$DateTime>i])
+      diff_time <- abs(as.numeric(min(as.numeric(difftime(lower, upper, units="mins")))))
+      diff_point <- abs(as.numeric(min(as.numeric(difftime(lower, as_datetime(i), units="mins")))))
+      if(diff_time<300){
+        mat <- matrix(nrow=diff_time, ncol=ncol(dd)-3)
+        colnames(mat) <- colnames(dd)[!colnames(dd)%in%c("Date", "Time", "DateTime")]
+        mat2 <- as.data.frame(rbind(dd[dd$DateTime==lower,!colnames(dd)%in%c("Date", "Time", "DateTime")],
+                      mat,
+                      dd[dd$DateTime==upper,!colnames(dd)%in%c("Date", "Time", "DateTime")]))
+        mat2 <- na_interpolation(mat2, option="linear")
+        arr <- c(NA, NA, NA, mat2[diff_point,])
+        names(arr) <- c("Date", "Time", "DateTime", colnames(dd)[!colnames(dd)%in%c("Date", "Time", "DateTime")])
+        arr <- arr[colnames(dd)]
+        
+        dd <- rbind(dd, arr)
+        dd[nrow(dd), "Date"] <- as.Date(format(as_datetime(i), format="%Y-%m-%d"))
+        dd[nrow(dd), "Time"] <- (format(as_datetime(i), format="%H:%M:%S"))
+        dd[nrow(dd), "DateTime"] <- as_datetime(i)
+      }
+    }
+  }
+  return(dd[dd$DateTime%in%datetime,])
+}
+
+```
+
+
+## Reduce collinearity in env variables
+
+```{r Reduce collinearity}
+
+EnvEnvCorr <- cor(as.matrix(LAO_meta %>% dplyr::select(-Date, -Time, -Collector, -Aeration, -Sludge, -DateTime)), use="complete.obs")
+corrplot::corrplot(EnvEnvCorr)
+selected.env1 <- c("Dry_matter", "PO4.P", "Nitrat", "NH4", "Oxygen",
+                  "Conductivity", "pH_manual", "Temp_manual", "Oxygen_manual")
+corrplot::corrplot(cor(LAO_meta[,selected.env1], use="complete.obs"))
+
+EnvEnvCorr <- cor(as.matrix(Sivec_meta %>% dplyr::select(-Date, -Time, -DateTime)), use="complete.obs")
+corrplot::corrplot(EnvEnvCorr)
+selected.env2 <- c("Inflow_Volume", "Inflow_pH", "Inflow_Conductivity",
+                  "Vat1_pH", "Vat1_Sludge", "Vat1_Nitrat", "Vat1_Oxygen", "Vat1_NH4.N", "Vat1_PO4.P",
+                  "Vat2_pH", "Vat2_Sludge", "Vat2_Nitrat", "Vat2_Oxygen", "Vat2_NH4.N", "Vat2_PO4.P",
+                  "Areation", "Air_Pressure")
+corrplot::corrplot(cor(Sivec_meta[,selected.env2], use="complete.obs"))
+
+Sivec_interpolated <- rbind(Sivec_meta,
+                            get_interpolated_Sivec(Sivec_meta,
+                                                   c(LAO_meta$DateTime))) %>%
+  distinct(.keep_all = T)
+
+env_meta <- full_join(Sivec_interpolated, (LAO_meta %>% dplyr::select(-Time, -Date))) %>%
+  mutate(Aeration=ifelse(Aeration=="YES", 1, 0))
+
+date2timedate <- LAO_meta$DateTime
+names(date2timedate) <- LAO_meta$Date
+
+selected.env <- c(selected.env1, selected.env2)
+
+EnvEnvCorr <- cor(as.matrix(env_meta[, selected.env]), use="pairwise.complete.obs", method="spearman")
+corrplot::corrplot(EnvEnvCorr, order = "hclust")
+
+selected.env3 <- c("PO4.P", "Temp_manual", "Dry_matter", "Conductivity", "Aeration", "Vat1_NH4.N", "Vat2_NH4.N", "Nitrat", "Inflow_Volume", "NH4", "Oxygen", "Vat2_pH", "Oxygen_manual", "pH_manual", "Inflow_pH", "Sludge")
+
+```
+
+## Environmental variables distribution and transformation
+
+```{r Environmental variables distribution and transformation}
+
+env_meta[,selected.env3] %>%
+  dplyr::select(-Aeration) %>%
+  mutate(Sludge=ifelse(Sludge=="YES", 1, 0)) %>%
+  pivot_longer(everything(), names_to="Var", values_to="value") %>%
+  filter(!is.na(value)) %>%
+  ggplot(aes(x=value)) +
+  geom_histogram() +
+  facet_wrap(Var~., ncol=2, scales="free") +
+  theme_classic()
+
+env_meta[,selected.env3] %>%
+  dplyr::select(-Aeration) %>%
+  mutate(Sludge=ifelse(Sludge=="YES", 1, 0)) %>%
+  mutate(Nitrat=sqrt(Nitrat),
+         Oxygen_manual=sqrt(Oxygen_manual),
+         Dry_matter=sqrt(Dry_matter),
+         Vat2_NH4.N=sqrt(Vat2_NH4.N),
+         NH4=sqrt(NH4),
+         Oxygen=sqrt(Oxygen),
+         Vat1_NH4.N=sqrt(Vat1_NH4.N)) %>%
+  pivot_longer(everything(), names_to="Var", values_to="value") %>%
+  filter(!is.na(value)) %>%
+  ggplot(aes(x=value)) +
+  geom_histogram() +
+  facet_wrap(Var~., ncol=2, scales="free") +
+  theme_classic()
+
+env_meta[,selected.env3] <- env_meta[,selected.env3] %>%
+  mutate(Nitrat=sqrt(Nitrat),
+         Oxygen_manual=sqrt(Oxygen_manual),
+         Dry_matter=sqrt(Dry_matter),
+         Vat2_NH4.N=sqrt(Vat2_NH4.N),
+         NH4=sqrt(NH4),
+         Oxygen=sqrt(Oxygen),
+         Vat1_NH4.N=sqrt(Vat1_NH4.N),
+         Sludge=ifelse(Sludge=="YES", 1, 0))
+```
+
+### Arima predictions using EGs
+
+```{r Arima predictions}
+
+date2timedate <- LAO_meta$DateTime
+names(date2timedate) <- LAO_meta$Date
+
+selected.env_lag <- selected.env3 <- c("PO4.P", "Temp_manual", "Dry_matter", "Conductivity", "Aeration", "Vat1_NH4.N", "Vat2_NH4.N", "Nitrat", "Inflow_Volume", "NH4", "Oxygen", "Vat2_pH", "Oxygen_manual", "pH_manual", "Inflow_pH")
+selected.env <- selected.env3 <- c("PO4.P", "Temp_manual", "Dry_matter", "Conductivity", "Aeration", "Vat1_NH4.N", "Vat2_NH4.N", "Nitrat", "Inflow_Volume", "NH4", "Oxygen", "Vat2_pH", "Oxygen_manual", "pH_manual", "Inflow_pH")
+selected.env_lag <- selected.env3 <- selected.env <- c( "Dry_matter", "PO4.P", "Nitrat", "NH4", "Oxygen", "Conductivity", "pH_manual", "Temp_manual", "Oxygen_manual",
+                                                        "Inflow_Volume", "Inflow_pH",
+                                                        "Vat1_NH4.N",
+                                                        "Vat2_NH4.N", "Vat2_pH",
+                                                        "Aeration")
+
+
+expl_block <- c("Manual", "Manual", "Manual", "Manual", "Manual", "Manual", "Manual", "Manual", "Manual",
+                "Inflow", "Inflow",
+                "Vat1",
+                "Vat2", "Vat2",
+                "Manual",
+                "Model", "Model", "Model", "Model",
+                "Model", "Model", "Model", "Model", "Model",
+                "Model", "Model",
+                "Model", "Model", "Model", "Model",
+                "Model", "Model", "Model", "Model", "Model", "Model",
+                "Model", "Model", "Model", "Model", "Model", "Model", "Model", "Model",
+                "Model")
+names(expl_block) <- c(selected.env_lag, c("ma1", "ma2", "ma3", "ma4",
+                                       "ar1", "ar2", "ar3", "ar4", "ar5",
+                                       "fourier(K = 1)C1_52", "fourier(K = 1)S1_52",
+                                       "fourier(K = 2)C1_52", "fourier(K = 2)S1_52", "fourier(K = 2)C2_52", "fourier(K = 2)S2_52",
+                                       "fourier(K = 3)C1_52", "fourier(K = 3)S1_52", "fourier(K = 3)C2_52", "fourier(K = 3)S2_52", "fourier(K = 3)C3_52", "fourier(K = 3)S3_52",
+                                       "fourier(K = 4)C1_52", "fourier(K = 4)S1_52", "fourier(K = 4)C2_52", "fourier(K = 4)S2_52", "fourier(K = 4)C3_52", "fourier(K = 4)S3_52", "fourier(K = 4)C4_52", "fourier(K = 4)S4_52",
+                                       "intercept"))
+
+expl_short <- c("Dry_matter", "PO4.P", "Nitrat", "NH4", "Oxygen", "Conductivity", "pH", "Temp", "Oxygen",
+                "Volume", "pH",
+                "NH4.N",
+                "NH4.N", "pH",
+                "Areation",
+                "ma1", "ma2", "ma3", "ma4",
+                "ar1", "ar2", "ar3", "ar4", "ar5",
+                "Cos1", "Sin1",
+                "Cos1", "Sin1", "Cos2", "Sin2",
+                "Cos1", "Sin1", "Cos2", "Sin2", "Cos3", "Sin3",
+                "Cos1", "Sin1", "Cos2", "Sin2", "Cos3", "Sin3", "Cos4", "Sin4",
+                "intercept")
+names(expl_short) <-  c(selected.env_lag, c("ma1", "ma2", "ma3", "ma4",
+                                        "ar1", "ar2", "ar3", "ar4", "ar5",
+                                        "fourier(K = 1)C1_52", "fourier(K = 1)S1_52",
+                                       "fourier(K = 2)C1_52", "fourier(K = 2)S1_52", "fourier(K = 2)C2_52", "fourier(K = 2)S2_52",
+                                       "fourier(K = 3)C1_52", "fourier(K = 3)S1_52", "fourier(K = 3)C2_52", "fourier(K = 3)S2_52", "fourier(K = 3)C3_52", "fourier(K = 3)S3_52",
+                                       "fourier(K = 4)C1_52", "fourier(K = 4)S1_52", "fourier(K = 4)C2_52", "fourier(K = 4)S2_52", "fourier(K = 4)C3_52", "fourier(K = 4)S3_52", "fourier(K = 4)C4_52", "fourier(K = 4)S4_52",
+                                        "intercept"))
+
+Omics.expl.Ps <- data.frame(Omic=NA, expl.var=NA, EG_num=0, Pvalue=1, est.value=0, mat_name="")
+
+Pred.comparison <- data.frame(date=as.Date('01-01-01'),
+                              pred.value=0, dist.value=0, real.value=0, decay.value=0, up.value=0, null.value=0,
+                              omic="", mat.name="", EG.num=0)
+
+omic_type <- c("MG", "MT", "MP")
+mat_name <- c(".raw", ".tax.phylum", ".tax.class", ".tax.order", ".tax.family", ".tax.genus", ".tax.species", ".fun.C_name", ".fun.D_name")
+
+for(omic.type in omic_type){
+  for(mat.name in mat_name){
+    
+    assign(paste(omic.type, mat.name, ".Rsq", sep=""), data.frame(matrix(0, ncol=6, nrow=ncol(get(paste(omic.type, mat.name, ".train.svd.corr", sep=""))$v)-1)) %>%
+      `colnames<-`(c("Test2012", "Test2013", "Test2014", "Test2015", "Test2016", "Train")))
+    assign(paste(omic.type, "raw.EGs.corr", sep="."), list())
+    
+    for(i in get(paste(omic.type, mat.name, ".NonStatEG.corr", sep=""))){
+      
+      if(mat.name==".raw"){
+        name.to.test <- paste0(omic.type, mat.name, ".a.EG", i)
+      } else {
+        name.to.test <- paste0(omic.type, mat.name, ".EG", i)
+      }
+
+      if(name.to.test %in% noise.ff$rep_EG){ #T){
+
+        ts.pred <- cbind(data.frame(date = date2timedate[colnames(MG.raw.train.clr.corr)],
+                                    value=as.numeric(get(paste(omic.type, mat.name, ".train.svd.corr", sep=""))$v[,i])),
+                         as.data.frame(scale(env_meta[env_meta$DateTime%in%date2timedate[colnames(MG.raw.train.clr.corr)], selected.env_lag], center=T, scale=T))) %>%
+          mutate(date = as.Date(date)) %>% 
+          filter(!is.na(value)) %>%
+        mutate(date = tsibble::yearweek(date)) %>%
+        as_tsibble(index=date) %>%
+        tsibble::fill_gaps() %>%
+        imputeTS::na_interpolation()
+        
+        to_predict <- cbind(scale(env_meta[, selected.env_lag], center=T, scale=T),
+                          env_meta[, c("Date", "Time")]) %>%
+        filter(!is.na(Date), !is.na(Time)) %>%
+        mutate(date = as.POSIXct(paste(Date, Time), format="%Y-%m-%d %H:%M:%S")) %>%
+        filter(date>colnames(MG.raw.train.clr.corr)[1], date<"2016-07-01") %>%
+        filter(Time>"06:00:00", Time<"14:00:00") %>%
+        mutate(date = as.Date(date)) %>%
+        group_by(date) %>%
+        summarise_at(selected.env_lag, mean, na.rm=T)
+        
+        to_predict <- full_join(to_predict %>%
+                              filter(date%in%as.Date(date2timedate[c(colnames(MG.raw.train.clr.corr), colnames(MG.raw.test.clr.corr))])) %>%
+                              mutate(date = tsibble::yearweek(date)),
+                            to_predict %>%
+                              mutate(date = tsibble::yearweek(date)) %>%
+                              filter(!date%in%tsibble::yearweek(date2timedate[c(colnames(MG.raw.train.clr.corr), colnames(MG.raw.test.clr.corr))])) %>%
+                              group_by(date) %>%
+                              summarise_at(selected.env_lag, mean, na.rm=T) %>%
+                              ungroup()) %>%
+          as_tsibble(index=date) %>%
+          tsibble::fill_gaps() %>%
+          imputeTS::na_interpolation()
+        
+        if(omic.type=="MP"){
+          
+          dd.eval <- data.frame(date=tsibble::yearweek(date2timedate[c(colnames(MG.raw.train.clr.corr), colnames(MG.raw.test.clr.corr))]),
+                             real.value=c(as.numeric(get(paste(omic.type, mat.name, ".train.svd.corr", sep=""))$v[,i]),
+                                          as.numeric(MG.raw.test.svd.corr[,i]))) %>%
+          as_tsibble(index=date)
+          
+        } else {
+          
+          dd.eval <- data.frame(date=tsibble::yearweek(date2timedate[c(colnames(MG.raw.train.clr.corr), colnames(MG.raw.test.clr.corr))]),
+                             real.value=c(as.numeric(get(paste(omic.type, mat.name, ".train.svd.corr", sep=""))$v[,i]),
+                                          as.numeric(get(paste(omic.type, mat.name, ".test.svd.corr", sep=""))[,i]))) %>%
+          as_tsibble(index=date)
+        }
+        
+        best_cycle <- arima_cycles2(ts.pred, to_predict, dd.eval, "value", selected.env_lag, 4)
+        best_model <- best_cycle[[2]][[1]]
+        best_cycle <- best_cycle[[1]][[1]]
+        
+        Ps.cycle <- best_model$ari[[1]]$fit$par$p.value
+        est.cycle <- best_model$ari[[1]]$fit$par$estimate
+        Omics.expl.Ps <- rbind(Omics.expl.Ps,
+                            data.frame(Omic=omic.type, expl.var=names(Ps.cycle), EG_num=i, Pvalue=Ps.cycle, est.value=est.cycle, mat_name=substring(mat.name, 2, str_length(mat.name))))
+        
+        dd <- full_join(data.frame(date=best_cycle$date,
+                                   pred.value=mean(best_cycle$value, na.rm=T),
+                                   dist.value=best_cycle$value),
+                                     dd.eval)
+  
+        decay.term <- c(rep(0,58), dd$pred.value[59:length(dd$date)]*(1-exp(-0.02*as.numeric(dd$date[59:length(dd$date)]-dd$date[58]))))
+        up.term <- c(rep(0,58), dd$pred.value[59:length(dd$date)]*(1-exp(0.02*as.numeric(dd$date[59:length(dd$date)]-dd$date[58]))))
+
+          dd_report <- dd %>%
+          mutate(decay.value = pred.value-decay.term,
+                 up.value = pred.value-up.term,
+                 null.value = 0,
+                 omic = omic.type,
+                 mat.name = substring(mat.name, 2, str_length(mat.name)),
+                 EG.num = i)
+        
+        Pred.comparison <- rbind(Pred.comparison, dd_report)
+              
+        dd1 <- dd %>%
+        mutate(Year = year(date)) %>%
+        filter(!is.na(pred.value)) %>%
+        mutate(y05=unlist(lapply(.$dist.value, FUN=function(x) qnorm(0.05, x$mu, x$sigma))),
+               y95=unlist(lapply(.$dist.value, FUN=function(x) qnorm(0.95, x$mu, x$sigma)))) %>%
+        mutate(Group=case_when(as.Date(date)<"2012-06-01"~"Train",
+                               as.Date(date)>="2012-06-01"~"Test"))
+        
+        if(omic.type=="MP"){
+          dd1 <- dd1 %>%
+            filter(Group=="Train")
+        }
+        
+        cycle_plot <- dd1 %>%
+        ggplot(aes(x=as.Date(date))) +
+        geom_ribbon(aes(ymin=y05, ymax=y95), alpha=0.3) +
+        geom_segment(aes(x=as.Date(date), xend=as.Date(date), y=pred.value, yend=real.value),
+                     color="black", size=0.25, linetype="dotted") +
+        geom_line(aes(y=pred.value, group=1), color="black", size=0.50) +
+        geom_point(aes(y=pred.value), color="blue") +
+        geom_point(data=subset(dd1, Group=="Test"), aes(y=real.value), color="red") +
+        geom_point(data=subset(dd1, Group=="Train"), aes(y=real.value), color="darkgreen") +
+        theme_classic() +
+        theme(axis.text.x = element_text(angle = 60, hjust = 1)) +
+          theme(panel.grid.major = element_line(colour="grey", size=0.25, linetype="dashed"),
+            legend.position = "none", panel.grid.major.x = element_blank()) +
+        scale_x_date(date_breaks="3 month", date_labels="%b %Y") +
+        labs(y="EG Value", x="Time")
+        
+        ggsave(paste0(wd, "/results/figures/EG_plots/", substring(mat.name, 2, str_length(mat.name)), "_", omic.type, "-EG", i, "_corr.png"), cycle_plot, dpi=320, height=3, width=8)
+        
+        best_eval <- eval_model(dd, "real.value", "pred.value")
+        
+        tmp.mat <- get(paste(omic.type, mat.name, ".Rsq", sep=""))
+        tmp.mat[i,] <- best_eval$Rsq[,1]
+        assign(paste(omic.type, mat.name, ".Rsq", sep=""), tmp.mat)
+        
+      } 
+      
+    }
+    
+  }
+  
+}
+
+Omics.expl.Ps <- Omics.expl.Ps[2:nrow(Omics.expl.Ps),]
+
+```
+
+
+### Env explanatory plot
+
+```{r Env explanatory plot}
+
+short.order <- c("intercept",
+                 "ma1", "ma2", "ma3", "ma4",
+                 "ar1", "ar2", "ar3", "ar4", "ar5",
+                 "Cos1", "Sin1", "Cos2", "Sin2", "Cos3", "Sin3", "Cos4", "Sin4", "Cos5", "Sin5",  "Cos6", "Sin6",  "Cos7", "Sin7",
+                 "pH", "NH4", "NH4.N", "Nitrat", "PO4.P", "Temp", "Oxygen", "Volume", "Sludge", "Areation", "Air_Pressure", "Dry_matter", "Conductivity")
+short.block <- c("Model", "Manual", "Inflow", "Vat1", "Vat2")
+
+Omics.expl.Ps.plot <- Omics.expl.Ps %>%
+  mutate(expl.block=expl_block[expl.var], expl.short=expl_short[expl.var]) %>%
+  mutate(EG_name=ifelse(mat_name=="raw",
+                        paste0(Omic, ".", mat_name, ".a.EG", EG_num),
+                        paste0(Omic, ".", mat_name, ".EG", EG_num))) %>%
+  filter(EG_name %in% noise.ff$rep_EG) %>%
+  mutate(signal_name=colors2num[non_stat2mod[EG_name]]) %>%
+  filter(EG_num!=0, !is.nan(Pvalue)) %>%
+  mutate(Pvalue=p.adjust(Pvalue, method="BH")) %>%
+  filter(Pvalue<0.05) %>%
+  mutate(signal_name=factor(signal_name, levels=rev(levels(signal_name))), sign.value=factor(sign(est.value)), est.value=abs(est.value)) %>%
+  ggplot(aes(x=factor(expl.short, levels=short.order),
+             y=signal_name, size=est.value,
+             fill=log10(Pvalue), color=sign.value)) +
+  geom_point(shape=21, stroke=0.75, alpha=0.75) +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle=60, hjust=1)) +
+  scale_fill_viridis(option="cividis") +
+  facet_grid(.~factor(expl.block, levels=short.block), scales="free_x", space="free", drop=T) +
+  labs(x="Explanatory term or variable", y="Eigengene (EG)") +
+  geom_rect(aes(xmin=-Inf, xmax=Inf, ymin=-Inf, ymax=Inf),
+            colour="black", fill=NA, inherit.aes=FALSE, size=0.5) +
+  theme(panel.grid.major = element_line(colour="grey", size=0.25, linetype="dashed"))
+
+Omics.expl.Ps.plot
+ 
+ggsave(paste0(wd, "/results/figures/Expl_Ps_corr_smallMRS.png"), Omics.expl.Ps.plot, dpi=320, height=4, width=8)
+ggsave(paste0(wd, "/results/figures/Expl_Ps_corr_smallMRS.svg"), Omics.expl.Ps.plot, dpi=320, height=4, width=8)
+
+```
+
+
+### Multimodel forecasting
+
+```{r Multimodel forecasting}
+
+library(fable.prophet)
+library(distributional)
+
+date2timedate <- LAO_meta$DateTime
+names(date2timedate) <- LAO_meta$Date
+
+selected.env <- selected.env3 <- c("PO4.P", "Temp_manual", "Dry_matter", "Conductivity", "Aeration", "Vat1_NH4.N", "Vat2_NH4.N", "Nitrat", "Inflow_Volume", "NH4", "Oxygen", "Vat2_pH", "Oxygen_manual", "pH_manual", "Inflow_pH")
+
+signal.mat <- all.EGs[,EG_names%in%noise.ff$rep_EG] %>%
+  `colnames<-`(colors2num[non_stat2mod[EG_names[EG_names%in%noise.ff$rep_EG]]])
+
+omic_type <- c("MG", "MT")
+fun_lvl <- paste("fun", c("C_name", "D_name"), sep=".")
+tax_lvl <- paste("tax", c("phylum", "class", "order", "family", "genus", "species"), sep=".")
+subsets <- c(fun_lvl, tax_lvl)
+set_type_dd <- paste0(c((expand.grid(a=omic_type, b=subsets) %>% mutate(d=paste(a, b, sep=".")))$d, "MG.raw", "MT.raw"), ".test.svd.corr")
+
+all.projected <- do.call(cbind, lapply(as.list(set_type_dd), function(x) get(x)))
+
+projected.mat <- all.projected[,EG_names[!startsWith(EG_names, "MP")]%in%noise.ff$rep_EG] %>%
+  `colnames<-`(colors2num[non_stat2mod[EG_names[EG_names%in%noise.ff$rep_EG]]])
+
+to_predict <- cbind(scale(env_meta[, selected.env3], center=T, scale=T),
+                    env_meta[, c("Date", "Time")]) %>%
+  filter(!is.na(Date), !is.na(Time)) %>%
+  mutate(date = as.POSIXct(paste(Date, Time), format="%Y-%m-%d %H:%M:%S")) %>%
+  filter(date>colnames(MG.raw.train.clr.corr)[1], date<"2016-07-01") %>%
+  filter(Time>"06:00:00", Time<"14:00:00") %>%
+  mutate(date = as.Date(date)) %>%
+  group_by(date) %>%
+  summarise_at(selected.env3, mean, na.rm=T)
+
+to_predict <- full_join(to_predict %>%
+                      filter(date%in%as.Date(date2timedate[c(colnames(MG.raw.train.clr.corr), colnames(MG.raw.test.clr.corr))])) %>%
+                      mutate(date = tsibble::yearweek(date)),
+                    to_predict %>%
+                      mutate(date = tsibble::yearweek(date)) %>%
+                      filter(!date%in%tsibble::yearweek(date2timedate[c(colnames(MG.raw.train.clr.corr), colnames(MG.raw.test.clr.corr))])) %>%
+                      group_by(date) %>%
+                      summarise_at(selected.env3, mean, na.rm=T) %>%
+                      ungroup()) %>%
+  as_tsibble(index=date) %>%
+  tsibble::fill_gaps() %>%
+  imputeTS::na_interpolation()
+
+for(i in 1:17){
+  signal.cyle <- paste0("S", i)
+  
+  ts.pred <- cbind(data.frame(date = date2timedate[colnames(MG.raw.train.clr.corr)],
+                                      value=as.numeric(signal.mat[sampled_weeks, signal.cyle])),
+                           as.data.frame(scale(env_meta[env_meta$DateTime%in%date2timedate[colnames(MG.raw.train.clr.corr)], selected.env],
+                                               center=T, scale=T))) %>%
+            mutate(date = as.Date(date)) %>% 
+            filter(!is.na(value)) %>%
+          mutate(date = tsibble::yearweek(date)) %>%
+          as_tsibble(index=date) %>%
+          tsibble::fill_gaps() %>%
+          imputeTS::na_interpolation()
+  
+  ts.test <- cbind(data.frame(date = date2timedate[colnames(MG.raw.test.clr.corr)],
+                                      value=as.numeric(projected.mat[, signal.cyle])),
+                           as.data.frame(scale(env_meta[env_meta$DateTime%in%date2timedate[colnames(MG.raw.test.clr.corr)], selected.env3], center=T, scale=T))) %>%
+            mutate(date = as.Date(date)) %>% 
+            filter(!is.na(value)) %>%
+          mutate(date = tsibble::yearweek(date)) %>%
+          as_tsibble(index=date)
+  
+  ts.tot <- ts.pred %>%
+    bind_rows(ts.test)
+  
+  fit <- ts.pred %>%
+    model(
+      arima0 = ARIMA(value~PO4.P+Temp_manual+Dry_matter+Conductivity+Aeration+Vat1_NH4.N+Vat2_NH4.N+Nitrat+
+                      Inflow_Volume+NH4+Oxygen+Vat2_pH+Oxygen_manual+pH_manual+Inflow_pH),
+      arima1 = ARIMA(value~PO4.P+Temp_manual+Dry_matter+Conductivity+Aeration+Vat1_NH4.N+Vat2_NH4.N+Nitrat+
+                      Inflow_Volume+NH4+Oxygen+Vat2_pH+Oxygen_manual+pH_manual+Inflow_pH+fourier(K=1)),
+      arima2 = ARIMA(value~PO4.P+Temp_manual+Dry_matter+Conductivity+Aeration+Vat1_NH4.N+Vat2_NH4.N+Nitrat+
+                      Inflow_Volume+NH4+Oxygen+Vat2_pH+Oxygen_manual+pH_manual+Inflow_pH+fourier(K=2)),
+      arima3 = ARIMA(value~PO4.P+Temp_manual+Dry_matter+Conductivity+Aeration+Vat1_NH4.N+Vat2_NH4.N+Nitrat+
+                      Inflow_Volume+NH4+Oxygen+Vat2_pH+Oxygen_manual+pH_manual+Inflow_pH+fourier(K=3)),
+      arima4 = ARIMA(value~PO4.P+Temp_manual+Dry_matter+Conductivity+Aeration+Vat1_NH4.N+Vat2_NH4.N+Nitrat+
+                      Inflow_Volume+NH4+Oxygen+Vat2_pH+Oxygen_manual+pH_manual+Inflow_pH+fourier(K=4)),
+      prophet0 = prophet(value~season(period="year",order=NULL, type=c("additive"))+growth(type="logistic", capacity=0.1)+
+                          PO4.P+Temp_manual+Dry_matter+Conductivity+Aeration+Vat1_NH4.N+Vat2_NH4.N+Nitrat+
+                          Inflow_Volume+NH4+Oxygen+Vat2_pH+Oxygen_manual+pH_manual+Inflow_pH),
+      prophet1 = prophet(value~season(period="year",order=1, type=c("additive"))+growth(type="logistic", capacity=0.1)+
+                          PO4.P+Temp_manual+Dry_matter+Conductivity+Aeration+Vat1_NH4.N+Vat2_NH4.N+Nitrat+
+                          Inflow_Volume+NH4+Oxygen+Vat2_pH+Oxygen_manual+pH_manual+Inflow_pH),
+      prophet2 = prophet(value~season(period="year",order=2, type=c("additive"))+growth(type="logistic", capacity=0.1)+
+                          PO4.P+Temp_manual+Dry_matter+Conductivity+Aeration+Vat1_NH4.N+Vat2_NH4.N+Nitrat+
+                          Inflow_Volume+NH4+Oxygen+Vat2_pH+Oxygen_manual+pH_manual+Inflow_pH),
+      prophet3 = prophet(value~season(period="year",order=3, type=c("additive"))+growth(type="logistic", capacity=0.1)+
+                          PO4.P+Temp_manual+Dry_matter+Conductivity+Aeration+Vat1_NH4.N+Vat2_NH4.N+Nitrat+
+                          Inflow_Volume+NH4+Oxygen+Vat2_pH+Oxygen_manual+pH_manual+Inflow_pH),
+      prophet4 = prophet(value~season(period="year",order=4, type=c("additive"))+growth(type="logistic", capacity=0.1)+
+                          PO4.P+Temp_manual+Dry_matter+Conductivity+Aeration+Vat1_NH4.N+Vat2_NH4.N+Nitrat+
+                          Inflow_Volume+NH4+Oxygen+Vat2_pH+Oxygen_manual+pH_manual+Inflow_pH),
+      nnetar10 = NNETAR(value~PO4.P+Temp_manual+Dry_matter+Conductivity+Aeration+Vat1_NH4.N+Vat2_NH4.N+Nitrat+
+                      Inflow_Volume+NH4+Oxygen+Vat2_pH+Oxygen_manual+pH_manual+Inflow_pH, n_nodes=10, scale_inputs=F),
+      nnetar20 = NNETAR(value~PO4.P+Temp_manual+Dry_matter+Conductivity+Aeration+Vat1_NH4.N+Vat2_NH4.N+Nitrat+
+                      Inflow_Volume+NH4+Oxygen+Vat2_pH+Oxygen_manual+pH_manual+Inflow_pH, n_nodes=20, scale_inputs=F),
+      nnetar30 = NNETAR(value~PO4.P+Temp_manual+Dry_matter+Conductivity+Aeration+Vat1_NH4.N+Vat2_NH4.N+Nitrat+
+                      Inflow_Volume+NH4+Oxygen+Vat2_pH+Oxygen_manual+pH_manual+Inflow_pH, n_nodes=30, scale_inputs=F))
+  
+  fc <- fit %>% fabletools::forecast(to_predict, times=20)
+  a <- fc %>% accuracy(ts.pred) %>% print()
+  models.weights <- (1/abs(a$RMSE))/(sum(1/abs(a$RMSE)))
+  models.weights <- ifelse(models.weights >= sort(models.weights, decreasing=T)[3], models.weights, 0)
+  models.weights <- models.weights/(sum(models.weights))
+  
+  combined <- (as.data.frame(as.data.frame(fc) %>%
+                              mutate(value=dist_normal(mu=mean(value), sigma=sqrt(variance(value)))) %>%
+                              pivot_wider(id_cols=c(date, selected.env), names_from=.model, values_from=value) %>%
+                              mutate(combined=arima0*models.weights[a$.model=="arima0"]+
+                                       arima1*models.weights[a$.model=="arima1"]+
+                                       arima2*models.weights[a$.model=="arima2"]+
+                                       arima3*models.weights[a$.model=="arima3"]+
+                                       arima4*models.weights[a$.model=="arima4"]+
+                                       prophet0*models.weights[a$.model=="prophet0"]+
+                                       prophet1*models.weights[a$.model=="prophet1"]+
+                                       prophet2*models.weights[a$.model=="prophet2"]+
+                                       prophet3*models.weights[a$.model=="prophet3"]+
+                                       prophet4*models.weights[a$.model=="prophet4"]+
+                                       nnetar10*models.weights[a$.model=="nnetar10"]+
+                                       nnetar20*models.weights[a$.model=="nnetar20"]+
+                                       nnetar30*models.weights[a$.model=="nnetar30"])) %>%
+                 pivot_longer(names_to=".model", values_to="value", -c(date, selected.env3)) %>%
+                 mutate(.mean=mean(value)) %>%
+                 as_tsibble(index=date, key=.model))[,c(".model", "date", "value", ".mean", selected.env3)]
+
+  a1 <- combined %>% as_fable(".mean", "value") %>% accuracy((ts.pred %>% dplyr::select(date, value) %>% mutate(.mean=value))) %>% print()
+  models.weights1 <- (1/abs(a$RMSE))/(sum(1/abs(a$RMSE)))
+  models.weights1 <- ifelse(models.weights1 >= sort(models.weights1, decreasing=T)[1], models.weights1, 0)
+  models.weights1 <- models.weights1/(sum(models.weights1))
+  
+  to.plot.cycle <- combined %>%
+    mutate(q05=quantile(value, 0.05), q95=quantile(value, 0.95)) %>%
+    filter(.model%in%a1$.model[models.weights1>0]) %>%
+    ggplot(aes(x=as.Date(date), y=median(value))) +
+    geom_ribbon(aes(ymin=q05, ymax=q95, fill=.model), alpha=0.3) +
+    geom_line(aes(group=.model, color=.model)) +
+    geom_point(data=ts.pred, aes(x=as.Date(date), y=value), color="darkgreen") +
+    geom_point(data=ts.test, aes(x=as.Date(date), y=value), color="darkred") +
+    theme_classic()
+  
+  plot(to.plot.cycle)
+  
+  print(paste0("Train EG: ", i))
+  combined %>% as_fable(".mean", "value") %>% accuracy((ts.pred %>% dplyr::select(date, value) %>% mutate(.mean=value))) %>% print()
+  print(paste0("Test EG: ", i))
+  combined %>% as_fable(".mean", "value") %>% accuracy((ts.test %>% dplyr::select(date, value) %>% mutate(.mean=value))) %>% print()
+
+  values.cycle <- ts.tot %>%
+    mutate(real.value=value, data.set=ifelse(as.Date(date) < as.Date("2012-06-01"), "train", "test")) %>%
+    dplyr::select(date, real.value, data.set) 
+  
+  if(i==1){
+    best.models <- left_join(combined %>%
+      filter(.model%in%a1$.model[models.weights1>0]) %>%
+      mutate(signal=paste0("S", i)) %>%
+      as.data.frame(),
+      values.cycle)
+    all.models <- left_join(combined %>%
+      filter(.model%in%a1$.model) %>%
+      mutate(signal=paste0("S", i)) %>%
+      as.data.frame(),
+      values.cycle)
+  } else {
+    best.models <- best.models %>%
+      bind_rows(left_join(combined %>%
+                   filter(.model%in%a1$.model[models.weights1>0]) %>%
+                   mutate(signal=paste0("S", i)) %>%
+      as.data.frame(),
+      values.cycle))
+    all.models <- all.models %>%
+      bind_rows(left_join(combined %>%
+                   filter(.model%in%a1$.model) %>%
+                   mutate(signal=paste0("S", i)) %>%
+      as.data.frame(),
+      values.cycle))
+  }
+  
+}
+
+best.models <- best.models %>%
+  as_tsibble(index=date, key=c(.model, signal))
+
+all.models <- all.models %>%
+  as_tsibble(index=date, key=c(.model, signal))
+
+```
+
+
+### Plot RMSE
+
+```{r Plot forecasting}
+
+rmse.plot <- all.models %>%
+  mutate(date=as.Date(date),
+         Set=case_when(date<"2012-06-01" ~ "Train",
+                       date>="2012-06-01" & date<"2013-06-01" ~ "Test2012",
+                       date>="2013-06-01" & date<"2014-06-01" ~ "Test2013",
+                       date>="2014-06-01" & date<"2015-06-01" ~ "Test2014",
+                       date>="2015-06-01" & date<"2016-06-01" ~ "Test2015",
+                       date>="2016-06-01" & date<"2017-06-01" ~ "Test2016")) %>%
+  mutate(group_set=ifelse(Set=="Train", "Train", "Test")) %>%
+  filter(!is.na(real.value)) %>%
+  group_by(group_set, .model, signal) %>%
+  mutate(abs.err=sqrt((median(value)-real.value)**2), 
+         RMSE=sqrt(mean((median(value)-real.value)**2))) %>%
+  filter(group_set=="Train") %>%
+  mutate(Model=.model) %>%
+  ggplot(aes(x=Model, y=abs.err, color=Model)) +
+  geom_violin() +
+  geom_point(aes(y=RMSE), color="black") +
+  facet_wrap(factor(signal, levels=paste0("S", 1:17))~., ncol=2) + 
+  theme_classic() +
+  theme(axis.text.x = element_text(angle=60, hjust=1)) +
+  labs(y="Absolute Error")
+
+rmse.plot
+
+ggsave(paste0(wd, "/results/figures/RMSE_signals.png"), rmse.plot, dpi=320, height=8, width=8)
+ggsave(paste0(wd, "/results/figures/RMSE_signals.svg"), rmse.plot, dpi=320, height=8, width=8)
+
+```
+
+
+### Plot forecasting
+
+```{r Plot forecasting}
+
+signal.forecast.plot <- best.models %>%
+  mutate(q05=quantile(value, 0.05), q95=quantile(value, 0.95)) %>%
+  ggplot(aes(x=as.Date(date), y=median(value))) +
+  geom_ribbon(aes(ymin=q05, ymax=q95, fill=.model), alpha=0.3) +
+  geom_line(aes(group=.model, color=.model)) +
+  geom_point(data=subset(best.models, data.set=="train"), aes(x=as.Date(date), y=real.value), color="darkgreen") +
+  geom_point(data=subset(best.models, data.set=="test"), aes(x=as.Date(date), y=real.value), color="darkred") +
+  theme_classic() +
+  facet_wrap(factor(signal, levels=paste0("S", 1:17))~., ncol=2)
+
+rmse.plot <- best.models %>%
+  mutate(date=as.Date(date),
+         Set=case_when(date<"2012-06-01" ~ "Train",
+                       date>="2012-06-01" & date<"2013-06-01" ~ "Test2012",
+                       date>="2013-06-01" & date<"2014-06-01" ~ "Test2013",
+                       date>="2014-06-01" & date<"2015-06-01" ~ "Test2014",
+                       date>="2015-06-01" & date<"2016-06-01" ~ "Test2015",
+                       date>="2016-06-01" & date<"2017-06-01" ~ "Test2016")) %>%
+  mutate(group_set=ifelse(Set=="Train", "Train", "Test")) %>%
+  filter(!is.na(real.value)) %>%
+  group_by(group_set, .model, signal) %>%
+  mutate(diff.value=median(value)-real.value) %>%
+  ggplot(aes(x=factor(group_set, levels=c("Train", "Test")), y=diff.value, color=group_set)) +
+  scale_color_manual(values=c("darkred", "darkgreen")) +
+  geom_point() +
+  geom_boxplot() +
+  facet_wrap(factor(signal, levels=paste0("S", 1:17))~., ncol=2) +
+  theme_classic() +
+  labs(x="Set of data")
+
+WN.P.table <- best.models %>% mutate(date=as.Date(date),
+                     Set=case_when(date<"2012-06-01" ~ "Train",
+                       date>="2012-06-01" & date<"2013-06-01" ~ "Test2012",
+                       date>="2013-06-01" & date<"2014-06-01" ~ "Test2013",
+                       date>="2014-06-01" & date<"2015-06-01" ~ "Test2014",
+                       date>="2015-06-01" & date<"2016-06-01" ~ "Test2015",
+                       date>="2016-06-01" & date<"2017-06-01" ~ "Test2016")) %>%
+  mutate(group_set=ifelse(Set=="Train", "Train", "Test")) %>%
+  filter(!is.na(real.value)) %>%
+  as.data.frame() %>%
+  dplyr::select(group_set, .model, signal, value, real.value) %>%
+  mutate(diff.value=median(value)-real.value) %>%
+  group_by(group_set, .model, signal) %>%
+  summarise(test=wilcox.test(diff.value, paired=F, alternative="two.sided", exact=T, mu=0, digits.rank=7)$p.value) %>%
+  mutate(test=p.adjust(test, method="BY")) %>%
+  as.data.frame() %>%
+  pivot_wider(names_from="group_set", values_from="test")
+
+WN.P.table
+
+
+
+ggsave(paste0(wd, "/results/figures/signal_forecast.png"), signal.forecast.plot, dpi=320, height=10, width=16)
+ggsave(paste0(wd, "/results/figures/signal_forecast.svg"), signal.forecast.plot, dpi=320, height=10, width=16)
+ggsave(paste0(wd, "/results/figures/signal_rmse.png"), rmse.plot, dpi=320, height=8, width=3)
+ggsave(paste0(wd, "/results/figures/signal_rmse.svg"), rmse.plot, dpi=320, height=8, width=3)
+
+```
+
+
+### Rewriting pathways
+
+```{r Rewriting pathways}
+
+for(omic.type in omic_type){
+
+  signals.dd <- as.data.frame((all.EGs[sampled_weeks, ] %>% `colnames<-`(EG_names))[,non_stat_tot_a]) %>%
+    `rownames<-`(colnames(MG.raw.train.clr.corr)) %>%
+    rownames_to_column(var="Sample") %>%
+    pivot_longer(names_to="EG_name", values_to="value", -c(Sample)) %>%
+    mutate(module=non_stat2mod[EG_name]) %>%
+    separate(EG_name, into=c("omic", "category", "subcategory", "EG_num"), sep="\\.", remove=F) %>%
+    mutate(module=colors2num[non_stat2mod[EG_name]]) %>%
+    filter(EG_name%in%unique(noise.ff$rep_EG))
+  
+  signals.mat <- (signals.dd %>%
+      pivot_wider(id_cols=Sample, names_from=module, values_from=value) %>%
+      column_to_rownames("Sample"))[,names(table(signals.dd$module))]
+  
+  lm.fit <- lm(t(as.matrix(get(paste0(omic.type, ".fun.C_name.train.clr.corr"))))~as.matrix(signals.mat))
+  sm.lm <- summary(lm.fit)
+  p.mat <- cbind(sapply(1:length(sm.lm), function(x) sm.lm[[x]]$coefficients[,4])) %>%
+    `colnames<-`(rownames(get(paste0(omic.type, ".fun.C_name.train.clr.corr")))) %>%
+    `rownames<-`(c("Intercept", paste0("S", 1:17)))
+  p.mat <- p.mat[,colnames(p.mat)!="Global maps onl"]
+  p.mat <- matrix(ifelse(p.adjust(p.mat, method = "BH")<0.05, 1, 1), ncol=ncol(p.mat)) %>%
+    `colnames<-`(colnames(p.mat)) %>%
+    `rownames<-`(rownames(p.mat))
+  
+  coeff.mat <- cbind(sapply(1:length(sm.lm), function(x) sm.lm[[x]]$coefficients[,1])) %>%
+    `colnames<-`(rownames(get(paste0(omic.type, ".fun.C_name.train.clr.corr")))) %>%
+    `rownames<-`(c("Intercept", paste0("S", 1:17)))
+  coeff.mat <- coeff.mat[,colnames(coeff.mat)!="Global maps onl"]
+  
+  assign(paste0(omic.type, ".pathway.p.mat"), p.mat)
+  assign(paste0(omic.type, ".pathway.coeff.mat"), coeff.mat)
+  
+  print(dim(p.mat))
+  print(rownames(p.mat))
+  print(dim(coeff.mat))
+  print(rownames(coeff.mat))
+  
+}
+
+```
+
+
+### Forecasting MG pathways
+
+```{r Forecasting MG pathways}
+
+MG.pathway.coeff.mat[-1,]
+
+forecast.block <- as.data.frame(best.models) %>%
+  filter(.model!="arima0") %>%
+  mutate(date=tsibble::yearweek(as.Date(date)),
+         pred.value=median(value)) %>%
+  filter(date%in%tsibble::yearweek(colnames(MG.fun.C_name.test.clr.corr))) %>%
+  dplyr::select(date, signal, pred.value) %>%
+  pivot_wider(names_from="date", id_cols="signal", values_from="pred.value") %>%
+  column_to_rownames(var="signal")
+
+forecast.block <- forecast.block[paste0("S", 1:17),]
+
+tsibble::yearweek(colnames(forecast.block))
+tsibble::yearweek(colnames(MG.fun.C_name.test.clr.corr))
+
+dim(forecast.block)
+dim(MG.pathway.coeff.mat[-1,])
+
+MG.pathway.rebuild <- t(t(as.matrix(forecast.block)) %*%
+                          (as.matrix(MG.pathway.coeff.mat[-1,])*MG.pathway.p.mat[-1,]) +
+                          as.matrix(MG.pathway.coeff.mat)[1,]*MG.pathway.p.mat[1,])
+
+dim(MG.pathway.rebuild)
+dim(MG.fun.C_name.test.clr.corr[rownames(MG.fun.C_name.test.clr.corr)!="Global maps onl",])
+
+a <- MG.pathway.rebuild-MG.fun.C_name.test.clr.corr[rownames(MG.pathway.rebuild),]
+
+MG.path.res <- full_join((as.data.frame(MG.pathway.rebuild) %>%
+             rownames_to_column(var="Pathway") %>%
+             pivot_longer(names_to="date", values_to="pred.value", -Pathway) %>%
+             mutate(date=tsibble::yearweek(date))),
+          (as.data.frame(MG.fun.C_name.test.clr.corr) %>%
+             rownames_to_column(var="Pathway") %>%
+             pivot_longer(names_to="date", values_to="real.value", -Pathway) %>%
+             mutate(date=tsibble::yearweek(date)) %>%
+             filter(Pathway%in%rownames(MG.pathway.rebuild))),
+          by=c("Pathway", "date")) %>%
+  mutate(res=pred.value-real.value)
+
+MG.path.forecasting.plot <- inner_join(MG.path.res,
+           (map_ko %>%
+              mutate(Pathway=C_name, Metabolism=B_name) %>%
+              dplyr::select(Pathway, Metabolism) %>%
+              distinct())) %>%
+  mutate(Year=year(date)) %>%
+  group_by(Pathway, Metabolism, Year) %>%
+  summarise(M.pred=mean(pred.value), M.real=mean(real.value)) %>%
+  ggplot(aes(x=M.pred, y=M.real, color=Metabolism)) +
+  geom_point() +
+  geom_smooth(aes(group=1), alpha=0.2, method=glm, formula=y~x, se=0) +
+  facet_wrap(Year~., nrow=1) +
+  theme_classic() +
+  labs(x="Average predicted value", y="Average measured value")
+
+ggsave(paste0(wd, "/results/figures/MG_path_forecasting.png"), MG.path.forecasting.plot, dpi=320, height=4, width=10)
+ggsave(paste0(wd, "/results/figures/MG_path_forecasting.png"), MG.path.forecasting.plot, dpi=320, height=4, width=10)
+
+```
+
+
+### Forecasting MT pathways
+
+```{r Forecasting MT pathways}
+
+MT.pathway.coeff.mat[-1,]
+
+forecast.block <- as.data.frame(best.models) %>%
+  filter(.model!="arima0") %>%
+  mutate(date=tsibble::yearweek(as.Date(date)),
+         pred.value=median(value)) %>%
+  filter(date%in%tsibble::yearweek(colnames(MT.fun.C_name.test.clr.corr))) %>%
+  dplyr::select(date, signal, pred.value) %>%
+  pivot_wider(names_from="date", id_cols="signal", values_from="pred.value") %>%
+  column_to_rownames(var="signal")
+
+forecast.block <- forecast.block[paste0("S", 1:17),]
+
+tsibble::yearweek(colnames(forecast.block))
+tsibble::yearweek(colnames(MT.fun.C_name.test.clr.corr))
+
+dim(forecast.block)
+dim(MT.pathway.coeff.mat[-1,])
+
+MT.pathway.rebuild <- t(t(as.matrix(forecast.block)) %*%
+                          (as.matrix(MT.pathway.coeff.mat[-1,])*MT.pathway.p.mat[-1,]) +
+                          as.matrix(MT.pathway.coeff.mat)[1,]*MT.pathway.p.mat[1,])
+
+dim(MT.pathway.rebuild)
+dim(MT.fun.C_name.test.clr.corr[rownames(MT.fun.C_name.test.clr.corr)!="Global maps onl",])
+
+a <- MT.pathway.rebuild-MT.fun.C_name.test.clr.corr[rownames(MT.pathway.rebuild),]
+
+MT.path.res <- full_join((as.data.frame(MT.pathway.rebuild) %>%
+             rownames_to_column(var="Pathway") %>%
+             pivot_longer(names_to="date", values_to="pred.value", -Pathway) %>%
+             mutate(date=tsibble::yearweek(date))),
+          (as.data.frame(MT.fun.C_name.test.clr.corr) %>%
+             rownames_to_column(var="Pathway") %>%
+             pivot_longer(names_to="date", values_to="real.value", -Pathway) %>%
+             mutate(date=tsibble::yearweek(date)) %>%
+             filter(Pathway%in%rownames(MT.pathway.rebuild))),
+          by=c("Pathway", "date")) %>%
+  mutate(res=pred.value-real.value)
+
+MT.path.forecasting.plot <- inner_join(MT.path.res,
+           (map_ko %>%
+              mutate(Pathway=C_name, Metabolism=B_name) %>%
+              dplyr::select(Pathway, Metabolism) %>%
+              distinct())) %>%
+  mutate(Year=year(date)) %>%
+  group_by(Pathway, Metabolism, Year) %>%
+  summarise(M.pred=mean(pred.value), M.real=mean(real.value)) %>%
+  ggplot(aes(x=M.pred, y=M.real, color=Metabolism)) +
+  geom_point() +
+  stat_smooth(geom="line", alpha=0.5, method="lm", formula=y~x, se=0) +
+  facet_wrap(Year~., nrow=1) +
+  theme_classic() +
+  labs(x="Average predicted value", y="Average measured value")
+
+ggsave(paste0(wd, "/results/figures/MT_path_forecasting.png"), MT.path.forecasting.plot, dpi=320, height=4, width=10)
+ggsave(paste0(wd, "/results/figures/MT_path_forecasting.svg"), MT.path.forecasting.plot, dpi=320, height=4, width=10)
+
+```
+
+
+### Rewriting Reactions
+
+```{r Rewriting Reactions}
+
+for(omic.type in omic_type){
+
+  signals.dd <- as.data.frame((all.EGs[sampled_weeks, ] %>% `colnames<-`(EG_names))[,non_stat_tot_a]) %>%
+    `rownames<-`(colnames(MG.raw.train.clr.corr)) %>%
+    rownames_to_column(var="Sample") %>%
+    pivot_longer(names_to="EG_name", values_to="value", -c(Sample)) %>%
+    mutate(module=non_stat2mod[EG_name]) %>%
+    separate(EG_name, into=c("omic", "category", "subcategory", "EG_num"), sep="\\.", remove=F) %>%
+    mutate(module=colors2num[non_stat2mod[EG_name]]) %>%
+    filter(EG_name%in%unique(noise.ff$rep_EG))
+  
+  signals.mat <- (signals.dd %>%
+      pivot_wider(id_cols=Sample, names_from=module, values_from=value) %>%
+      column_to_rownames("Sample"))[,names(table(signals.dd$module))]
+  
+  lm.fit <- lm(t(as.matrix(get(paste0(omic.type, ".fun.D_name.train.clr.corr"))))~as.matrix(signals.mat))
+  sm.lm <- summary(lm.fit)
+  p.mat <- cbind(sapply(1:length(sm.lm), function(x) sm.lm[[x]]$coefficients[,4])) %>%
+    `colnames<-`(rownames(get(paste0(omic.type, ".fun.D_name.train.clr.corr")))) %>%
+    `rownames<-`(c("Intercept", paste0("S", 1:17)))
+  p.mat <- p.mat[,colnames(p.mat)!="Global maps onl"]
+  p.mat <- matrix(ifelse(p.adjust(p.mat, method = "BH")<0.01, 1, 1), ncol=ncol(p.mat)) %>%
+    `colnames<-`(colnames(p.mat)) %>%
+    `rownames<-`(rownames(p.mat))
+  
+  coeff.mat <- cbind(sapply(1:length(sm.lm), function(x) sm.lm[[x]]$coefficients[,1])) %>%
+    `colnames<-`(rownames(get(paste0(omic.type, ".fun.D_name.train.clr.corr")))) %>%
+    `rownames<-`(c("Intercept", paste0("S", 1:17)))
+  coeff.mat <- coeff.mat[,colnames(coeff.mat)!="Global maps onl"]
+  
+  assign(paste0(omic.type, ".Reaction.p.mat"), p.mat)
+  assign(paste0(omic.type, ".Reaction.coeff.mat"), coeff.mat)
+  
+  print(dim(p.mat))
+  print(rownames(p.mat))
+  print(dim(coeff.mat))
+  print(rownames(coeff.mat))
+  
+}
+
+```
+
+
+### Forecasting MG Reactions
+
+```{r Forecasting MG Reactions}
+
+forecast.block <- as.data.frame(best.models) %>%
+  filter(.model!="arima0") %>%
+  mutate(date=tsibble::yearweek(as.Date(date)),
+         pred.value=median(value)) %>%
+  filter(date%in%tsibble::yearweek(colnames(MG.fun.D_name.test.clr.corr))) %>%
+  dplyr::select(date, signal, pred.value) %>%
+  pivot_wider(names_from="date", id_cols="signal", values_from="pred.value") %>%
+  column_to_rownames(var="signal")
+
+forecast.block <- forecast.block[paste0("S", 1:17),]
+
+tsibble::yearweek(colnames(forecast.block))
+tsibble::yearweek(colnames(MG.fun.D_name.test.clr.corr))
+
+dim(forecast.block)
+dim(MG.Reaction.coeff.mat[-1,])
+
+MG.Reaction.rebuild <- t(t(as.matrix(forecast.block)) %*%
+                          (as.matrix(MG.Reaction.coeff.mat[-1,])*MG.Reaction.p.mat[-1,]) +
+                          as.matrix(MG.Reaction.coeff.mat)[1,]*MG.Reaction.p.mat[1,])
+
+dim(MG.Reaction.rebuild)
+dim(MG.fun.D_name.test.clr.corr[rownames(MG.fun.D_name.test.clr.corr)!="Global maps onl",])
+
+a <- MG.Reaction.rebuild-MG.fun.D_name.test.clr.corr[rownames(MG.Reaction.rebuild),]
+
+MG.react.res <- full_join((as.data.frame(MG.Reaction.rebuild) %>%
+             rownames_to_column(var="Reaction") %>%
+             pivot_longer(names_to="date", values_to="pred.value", -Reaction) %>%
+             mutate(date=tsibble::yearweek(date))),
+          (as.data.frame(MG.fun.D_name.test.clr.corr) %>%
+             rownames_to_column(var="Reaction") %>%
+             pivot_longer(names_to="date", values_to="real.value", -Reaction) %>%
+             mutate(date=tsibble::yearweek(date)) %>%
+             filter(Reaction%in%rownames(MG.Reaction.rebuild))),
+          by=c("Reaction", "date")) %>%
+  mutate(res=pred.value-real.value)
+
+MG.react.forecasting.plot <- inner_join(MG.react.res,
+           (map_ko %>%
+              mutate(Reaction=D_name, Pathway=C_name, Metabolism=B_name) %>%
+              dplyr::select(Reaction, Pathway, Metabolism) %>%
+              distinct())) %>%
+  mutate(Year=year(date)) %>%
+  group_by(Reaction, Pathway, Metabolism, Year) %>%
+  summarise(M.pred=mean(pred.value), M.real=mean(real.value)) %>%
+  ggplot(aes(x=M.pred, y=M.real, color=Metabolism)) +
+  geom_point() +
+  geom_smooth(aes(group=1), alpha=0.2, method=glm, formula=y~x, se=0) +
+  facet_wrap(Year~., nrow=1) +
+  theme_classic() +
+  labs(x="Average predicted value", y="Average measured value")
+
+ggsave(paste0(wd, "/results/figures/MG_react_forecasting.png"), MG.react.forecasting.plot, dpi=320, height=4, width=10)
+ggsave(paste0(wd, "/results/figures/MG_react_forecasting.png"), MG.react.forecasting.plot, dpi=320, height=4, width=10)
+
+```
+
+
+### Forecasting MT Reactions
+
+```{r Forecasting MT Reactions}
+
+#MT.Reaction.coeff.mat[-1,]
+
+forecast.block <- as.data.frame(best.models) %>%
+  filter(.model!="arima0") %>%
+  mutate(date=tsibble::yearweek(as.Date(date)),
+         pred.value=median(value)) %>%
+  filter(date%in%tsibble::yearweek(colnames(MT.fun.D_name.test.clr.corr))) %>%
+  dplyr::select(date, signal, pred.value) %>%
+  pivot_wider(names_from="date", id_cols="signal", values_from="pred.value") %>%
+  column_to_rownames(var="signal")
+
+forecast.block <- forecast.block[paste0("S", 1:17),]
+
+tsibble::yearweek(colnames(forecast.block))
+tsibble::yearweek(colnames(MT.fun.D_name.test.clr.corr))
+
+dim(forecast.block)
+dim(MT.Reaction.coeff.mat[-1,])
+
+MT.Reaction.rebuild <- t(t(as.matrix(forecast.block)) %*%
+                          (as.matrix(MT.Reaction.coeff.mat[-1,])*MT.Reaction.p.mat[-1,]) +
+                          as.matrix(MT.Reaction.coeff.mat)[1,]*MT.Reaction.p.mat[1,])
+
+dim(MT.Reaction.rebuild)
+dim(MT.fun.D_name.test.clr.corr[rownames(MT.fun.D_name.test.clr.corr)!="Global maps onl",])
+
+a <- MT.Reaction.rebuild-MT.fun.D_name.test.clr.corr[rownames(MT.Reaction.rebuild),]
+
+MT.react.res <- full_join((as.data.frame(MT.Reaction.rebuild) %>%
+             rownames_to_column(var="Reaction") %>%
+             pivot_longer(names_to="date", values_to="pred.value", -Reaction) %>%
+             mutate(date=tsibble::yearweek(date))),
+          (as.data.frame(MT.fun.D_name.test.clr.corr) %>%
+             rownames_to_column(var="Reaction") %>%
+             pivot_longer(names_to="date", values_to="real.value", -Reaction) %>%
+             mutate(date=tsibble::yearweek(date)) %>%
+             filter(Reaction%in%rownames(MT.Reaction.rebuild))),
+          by=c("Reaction", "date")) %>%
+  mutate(res=pred.value-real.value)
+
+MT.react.forecasting.plot <- inner_join(MT.react.res,
+           (map_ko %>%
+              mutate(Reaction=D_name, Pathway=C_name, Metabolism=B_name) %>%
+              dplyr::select(Reaction, Pathway, Metabolism) %>%
+              distinct())) %>%
+  mutate(Year=year(date)) %>%
+  group_by(Reaction, Pathway, Metabolism, Year) %>%
+  summarise(M.pred=mean(pred.value), M.real=mean(real.value)) %>%
+  ggplot(aes(x=M.pred, y=M.real, color=Metabolism)) +
+  geom_point() +
+  geom_smooth(aes(group=1), alpha=0.2, method=glm, formula=y~x, se=0) +
+  facet_wrap(Year~., nrow=1) +
+  theme_classic() +
+  labs(x="Average predicted value", y="Average measured value")
+
+ggsave(paste0(wd, "/results/figures/MT_react_forecasting.png"), MT.react.forecasting.plot, dpi=320, height=4, width=10)
+ggsave(paste0(wd, "/results/figures/MT_react_forecasting.png"), MT.react.forecasting.plot, dpi=320, height=4, width=10)
+
+```
+
+
+### Rewriting Families
+
+```{r Rewriting Families}
+
+for(omic.type in omic_type){
+
+  signals.dd <- as.data.frame((all.EGs[sampled_weeks, ] %>% `colnames<-`(EG_names))[,non_stat_tot_a]) %>%
+    `rownames<-`(colnames(MG.raw.train.clr.corr)) %>%
+    rownames_to_column(var="Sample") %>%
+    pivot_longer(names_to="EG_name", values_to="value", -c(Sample)) %>%
+    mutate(module=non_stat2mod[EG_name]) %>%
+    separate(EG_name, into=c("omic", "category", "subcategory", "EG_num"), sep="\\.", remove=F) %>%
+    mutate(module=colors2num[non_stat2mod[EG_name]]) %>%
+    filter(EG_name%in%unique(noise.ff$rep_EG))
+  
+  signals.mat <- (signals.dd %>%
+      pivot_wider(id_cols=Sample, names_from=module, values_from=value) %>%
+      column_to_rownames("Sample"))[,names(table(signals.dd$module))]
+  
+  lm.fit <- lm(t(as.matrix(get(paste0(omic.type, ".tax.family.train.clr.corr"))))~as.matrix(signals.mat))
+  sm.lm <- summary(lm.fit)
+  p.mat <- cbind(sapply(1:length(sm.lm), function(x) sm.lm[[x]]$coefficients[,4])) %>%
+    `colnames<-`(rownames(get(paste0(omic.type, ".tax.family.train.clr.corr")))) %>%
+    `rownames<-`(c("Intercept", paste0("S", 1:17)))
+  p.mat <- matrix(ifelse(p.adjust(p.mat, method = "BH")<0.01, 1, 1), ncol=ncol(p.mat)) %>%
+    `colnames<-`(colnames(p.mat)) %>%
+    `rownames<-`(rownames(p.mat))
+  
+  coeff.mat <- cbind(sapply(1:length(sm.lm), function(x) sm.lm[[x]]$coefficients[,1])) %>%
+    `colnames<-`(rownames(get(paste0(omic.type, ".tax.family.train.clr.corr")))) %>%
+    `rownames<-`(c("Intercept", paste0("S", 1:17)))
+  
+  assign(paste0(omic.type, ".family.p.mat"), p.mat)
+  assign(paste0(omic.type, ".family.coeff.mat"), coeff.mat)
+  
+  print(dim(p.mat))
+  print(rownames(p.mat))
+  print(dim(coeff.mat))
+  print(rownames(coeff.mat))
+  
+}
+
+```
+
+
+### Forecasting MG Families
+
+```{r Forecasting MG Families}
+
+forecast.block <- as.data.frame(best.models) %>%
+  filter(.model!="arima0") %>%
+  mutate(date=tsibble::yearweek(as.Date(date)),
+         pred.value=median(value)) %>%
+  filter(date%in%tsibble::yearweek(colnames(MG.tax.family.test.clr.corr))) %>%
+  dplyr::select(date, signal, pred.value) %>%
+  pivot_wider(names_from="date", id_cols="signal", values_from="pred.value") %>%
+  column_to_rownames(var="signal")
+
+forecast.block <- forecast.block[paste0("S", 1:17),]
+
+tsibble::yearweek(colnames(forecast.block))
+tsibble::yearweek(colnames(MG.fun.D_name.test.clr.corr))
+
+dim(forecast.block)
+dim(MG.family.coeff.mat[-1,])
+
+MG.family.rebuild <- t(t(as.matrix(forecast.block)) %*%
+                          (as.matrix(MG.family.coeff.mat[-1,])*MG.family.p.mat[-1,]) +
+                          as.matrix(MG.family.coeff.mat)[1,]*MG.family.p.mat[1,])
+
+MG.family.res <- full_join((as.data.frame(MG.family.rebuild) %>%
+             rownames_to_column(var="family") %>%
+             pivot_longer(names_to="date", values_to="pred.value", -family) %>%
+             mutate(date=tsibble::yearweek(date))),
+          (as.data.frame(MG.tax.family.test.clr.corr) %>%
+             rownames_to_column(var="family") %>%
+             pivot_longer(names_to="date", values_to="real.value", -family) %>%
+             mutate(date=tsibble::yearweek(date)) %>%
+             filter(family%in%rownames(MG.family.rebuild))),
+          by=c("family", "date")) %>%
+  mutate(res=pred.value-real.value)
+
+MG.family.forecasting.plot <- inner_join(MG.family.res,
+           (LAO_tax %>%
+              dplyr::select(family, phylum) %>%
+              distinct())) %>%
+  mutate(Year=year(date)) %>%
+  group_by(family, phylum, Year) %>%
+  summarise(M.pred=mean(pred.value), M.real=mean(real.value)) %>%
+  ggplot(aes(x=M.pred, y=M.real)) +
+  geom_point() +
+  geom_smooth(aes(group=1), alpha=0.2, method=glm, formula=y~x, se=0) +
+  facet_wrap(Year~., nrow=1) +
+  theme_classic() +
+  labs(x="Average predicted value", y="Average measured value")
+
+ggsave(paste0(wd, "/results/figures/MG_family_forecasting.png"), MG.family.forecasting.plot, dpi=320, height=4, width=10)
+ggsave(paste0(wd, "/results/figures/MG_family_forecasting.png"), MG.family.forecasting.plot, dpi=320, height=4, width=10)
+
+```
+
+
+### Forecasting MT Families
+
+```{r Forecasting MT Families}
+
+forecast.block <- as.data.frame(best.models) %>%
+  filter(.model!="arima0") %>%
+  mutate(date=tsibble::yearweek(as.Date(date)),
+         pred.value=median(value)) %>%
+  filter(date%in%tsibble::yearweek(colnames(MT.tax.family.test.clr.corr))) %>%
+  dplyr::select(date, signal, pred.value) %>%
+  pivot_wider(names_from="date", id_cols="signal", values_from="pred.value") %>%
+  column_to_rownames(var="signal")
+
+forecast.block <- forecast.block[paste0("S", 1:17),]
+
+tsibble::yearweek(colnames(forecast.block))
+tsibble::yearweek(colnames(MT.fun.D_name.test.clr.corr))
+
+dim(forecast.block)
+dim(MT.family.coeff.mat[-1,])
+
+MT.family.rebuild <- t(t(as.matrix(forecast.block)) %*%
+                          (as.matrix(MT.family.coeff.mat[-1,])*MT.family.p.mat[-1,]) +
+                          as.matrix(MT.family.coeff.mat)[1,]*MT.family.p.mat[1,])
+
+MT.family.res <- full_join((as.data.frame(MT.family.rebuild) %>%
+             rownames_to_column(var="family") %>%
+             pivot_longer(names_to="date", values_to="pred.value", -family) %>%
+             mutate(date=tsibble::yearweek(date))),
+          (as.data.frame(MT.tax.family.test.clr.corr) %>%
+             rownames_to_column(var="family") %>%
+             pivot_longer(names_to="date", values_to="real.value", -family) %>%
+             mutate(date=tsibble::yearweek(date)) %>%
+             filter(family%in%rownames(MT.family.rebuild))),
+          by=c("family", "date")) %>%
+  mutate(res=pred.value-real.value)
+
+MT.family.forecasting.plot <- inner_join(MT.family.res,
+           (LAO_tax %>%
+              dplyr::select(family, phylum) %>%
+              distinct())) %>%
+  mutate(Year=year(date)) %>%
+  group_by(family, phylum, Year) %>%
+  summarise(M.pred=mean(pred.value), M.real=mean(real.value)) %>%
+  ggplot(aes(x=M.pred, y=M.real)) +
+  geom_point() +
+  geom_smooth(aes(group=1), alpha=0.2, method=glm, formula=y~x, se=0) +
+  facet_wrap(Year~., nrow=1) +
+  theme_classic() +
+  labs(x="Average predicted value", y="Average measured value")
+
+ggsave(paste0(wd, "/results/figures/MT_family_forecasting.png"), MT.family.forecasting.plot, dpi=320, height=4, width=10)
+ggsave(paste0(wd, "/results/figures/MT_family_forecasting.png"), MT.family.forecasting.plot, dpi=320, height=4, width=10)
+
+```
+
+
+### Multi June forecast
+
+```{r Multi June forecast}
+
+June.dd <- rbind((MG.path.res %>%
+         mutate(variable=Pathway, block="Pathway", omic="MG", date=as.Date(date)) %>%
+         dplyr::select(-Pathway)),
+      (MT.path.res %>%
+         mutate(variable=Pathway, block="Pathway", omic="MT", date=as.Date(date)) %>%
+         dplyr::select(-Pathway)),
+      (MG.react.res %>%
+         mutate(variable=Reaction, block="Reaction", omic="MG", date=as.Date(date)) %>%
+         dplyr::select(-Reaction)),
+      (MT.react.res %>%
+         mutate(variable=Reaction, block="Reaction", omic="MT", date=as.Date(date)) %>%
+         dplyr::select(-Reaction)),
+      (MG.family.res %>%
+         mutate(variable=family, block="Family", omic="MG", date=as.Date(date)) %>%
+         dplyr::select(-family)),
+      (MT.family.res %>%
+         mutate(variable=family, block="Family", omic="MT", date=as.Date(date)) %>%
+         dplyr::select(-family))) %>%
+  mutate(date=tsibble::yearweek(date), Year=year(date), block_omic=paste0(block, " ", omic))
+  
+June.Rsq.table <- June.dd %>%
+  group_by(variable, block_omic, Year) %>%
+  summarise(M.pred=mean(pred.value), M.real=mean(real.value)) %>%
+  group_by(block_omic, Year) %>%
+  summarise(correlation=cor.test(M.pred, M.real, method="pearson")$estimate**2) %>%
+  pivot_wider(id_cols="block_omic", names_from="Year", values_from="correlation")
+
+June.Rsq.table
+
+write.csv(June.Rsq.table, file=paste0(wd, "/results/tables/June_Rsq.csv"), row.names=F)
+
+June.individual.plot <- June.dd %>%
+  ggplot(aes(x=pred.value, y=real.value)) +
+  geom_point() +
+  facet_grid(as.factor(date)~block_omic) +
+  theme_classic() +
+  labs(x="Predicted value", y="Measured value")
+
+June.individual.plot
+
+ggsave(paste0(wd, "/results/figures/June_individual.png"), June.individual.plot, dpi=320, height=15, width=10)
+ggsave(paste0(wd, "/results/figures/June_individual.svg"), June.individual.plot, dpi=320, height=15, width=10)
+
+June.forecasting.plot <- June.dd %>%
+  group_by(variable, block_omic, Year) %>%
+  summarise(M.pred=mean(pred.value), M.real=mean(real.value)) %>%
+  ggplot(aes(x=M.pred, y=M.real)) +
+  geom_point() +
+  geom_smooth(aes(group=1), alpha=0.1, method=glm, formula=y~x, se=0) +
+  facet_grid(block_omic~Year) +
+  theme_classic() +
+  labs(x="Average predicted value", y="Average measured value")
+
+June.forecasting.plot
+
+ggsave(paste0(wd, "/results/figures/June_forecasting.png"), June.forecasting.plot, dpi=320, height=10, width=10)
+ggsave(paste0(wd, "/results/figures/June_forecasting.svg"), June.forecasting.plot, dpi=320, height=10, width=10)
+
+```
+
+
+### June train
+
+```{r June train}
+
+for(i in c("MG", "MT")){
+  for(j in c("tax.family", "fun.D_name", "fun.C_name")){
+    tmp.mat0 <- get(paste0(i, ".", j, ".train.clr.corr"))[,c("2011-06-03", "2011-06-09", "2011-06-17", "2011-06-24")]
+    tmp.mat1 <- get(paste0(i, ".", j, ".test.clr.corr"))[,c("2012-06-01", "2012-06-08", "2012-06-14", "2012-06-20", "2012-06-26")]
+    tmp.mat2 <- get(paste0(i, ".", j, ".test.clr.corr"))[,c("2013-06-06", "2013-06-12", "2013-06-18", "2013-06-25")]
+    tmp.mat3 <- get(paste0(i, ".", j, ".test.clr.corr"))[,c("2014-06-04", "2014-06-13", "2014-06-18", "2014-06-26")]
+    tmp.mat4 <- get(paste0(i, ".", j, ".test.clr.corr"))[,c("2015-06-04", "2015-06-10", "2015-06-17", "2015-06-25")]
+    tmp.mat5 <- get(paste0(i, ".", j, ".test.clr.corr"))[,c("2016-06-02", "2016-06-06", "2016-06-13", "2016-06-22")]
+    print(median(rowMeans(tmp.mat1)/rowMeans(tmp.mat0)))
+    print(median(rowMeans(tmp.mat2)/rowMeans(tmp.mat0)))
+    print(median(rowMeans(tmp.mat3)/rowMeans(tmp.mat0)))
+    print(median(rowMeans(tmp.mat4)/rowMeans(tmp.mat0)))
+    print(median(rowMeans(tmp.mat5)/rowMeans(tmp.mat0)))
+  }
+}
+
+```
