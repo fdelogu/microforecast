@@ -416,7 +416,9 @@ for(omic.type in omic_type){
     tmp.raw <- perc_filter(tmp.raw, 0.2, 0.0000001, colnames(tmp.raw)[1:51])
     print(paste0("Applying the low value censoring for ", omic.type, " raw data count."))
     tmp.raw <- censor_low(tmp.raw, 0.0000001, 0)
-    mean(colSums(get(paste0(omic.type, ".", "raw"))>0.001))
+    print(mean(colSums(get(paste0(omic.type, ".", "raw"))>0.0000001)))
+    print(sd(colSums(get(paste0(omic.type, ".", "raw"))>0.0000001)))
+    print(colSums(get(paste0(omic.type, ".", "raw"))>0.0000001))
   } else {
     tmp.raw <- get(paste0(omic.type, ".", "raw"))
     print(paste0("Exp transformation the ", omic.type, " raw data count."))
@@ -425,7 +427,9 @@ for(omic.type in omic_type){
     tmp.raw <- perc_filter(tmp.raw, 0.2, 0.001, colnames(tmp.raw)[1:51])
     print(paste0("Applying the low value censoring for ", omic.type, " raw data count."))
     tmp.raw <- censor_low_par(tmp.raw, 0.001, 0)
-    mean(colSums(get(paste0(omic.type, ".", "raw"))>0.0000001))
+    print(mean(colSums(get(paste0(omic.type, ".", "raw"))>0.001)))
+    print(sd(colSums(get(paste0(omic.type, ".", "raw"))>0.001)))
+    print(colSums(get(paste0(omic.type, ".", "raw"))>0.001))
   }
   tmp.raw <- multiplicative_replacement(t(tmp.raw)) # Rotate already for clr
   tmp.clr <- as.data.frame(t(clr(tmp.raw))) %>%
