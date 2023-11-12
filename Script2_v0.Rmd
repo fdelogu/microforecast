@@ -11,6 +11,8 @@ output: html_document
 
 ```{r setup}
 
+set.seed(123)
+
 options(stringsAsFactors = F, gsubfn.engine = "R")
 
 Sys.setenv("LANGUAGE"="En")
@@ -508,7 +510,7 @@ to_plot <- rbind((inner_join((exp(MG.raw[,1:51]) %>%
 KO.sub <- c("K03621", "K06117", "K00864", "K08591", "K13507", "K00631", "K00655", "K13509", "K13513", "K14674",
             "K07029", "K01054", "K01046", "K14674", "K01046", "K22848",
             "K00981", "K17103", "K01613", "K00570", "K00570", "K01114")
- 
+
 to_plot %>%
   filter(C_name%in%c("Glycerolipid metabolism")) %>%
   ggplot(aes(x=D_code, y=m, fill=family)) +
@@ -529,6 +531,17 @@ to_plot %>%
   facet_grid(C_name~factor(omic, levels=c("MG", "MT", "MP")), scale="free", space="free", drop=T) +
   coord_flip()
 
+to_plot_tax <- to_plot %>%
+  filter(D_code%in%KO.sub) %>%
+  left_join((LAO_tax %>%
+               dplyr::select(family, phylum) %>%
+               mutate(phylum=if_else(family=="not classified", "not classified", phylum)) %>%
+               distinct()), by="family")
+
+tmp <- to_plot_tax %>% group_by(phylum, family) %>% summarise() %>% pull(family)
+to_plot_tax <- to_plot_tax %>%
+  mutate(family=factor(family, levels=tmp))
+
 KO.sub.plot <- to_plot %>%
   mutate(Family=family) %>%
   filter(D_code%in%KO.sub) %>%
@@ -542,6 +555,20 @@ KO.sub.plot <- to_plot %>%
   coord_flip() +
   labs(x="KO term", y="log10(Abundance)")
   
+KO.sub.plot <- to_plot_tax %>%
+  mutate(Family=family) %>%
+  filter(D_code%in%KO.sub) %>%
+  ggplot(aes(x=D_code, y=m, fill=Family)) +
+  scale_fill_manual(values=c("gold", "gold2", "gold4", "chartreuse", "darkolivegreen2", "green4", "chartreuse4", "cornflowerblue", "grey77", "firebrick")) +
+  geom_bar(stat="identity") +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 60, hjust=1),
+        panel.border = element_rect(fill=NA, size=1)) +
+  scale_y_log10(expand=c(0,0), breaks=c(1, 1e+3, 1e+6, 1e+9, 1e+12, 1e+15, 1e+18, 1e+21)) +
+  facet_grid(.~factor(omic, levels=c("MG", "MT", "MP")), scale="free", space="free", drop=T) +
+  coord_flip() +
+  labs(x="KO term", y="log10(Abundance)")
+
 KO.sub.plot
 
 ggsave(paste0(wd, "/results/figures/KO.sub.png"), KO.sub.plot, dpi=320, height=6, width=6)
@@ -558,7 +585,7 @@ ggsave(paste0(wd, "/results/figures/KO.sub.svg"), KO.sub.plot, dpi=320, height=6
 
 arima_cycle0 <- function(ts.train, ts.test, target, predictors){
   
-  to_return1 <- ts.train %>%
+  set.seed(123); to_return1 <- ts.train %>%
     model(ari = ARIMA(as.formula(paste(target, paste0(c(predictors), collapse="+"), sep="~")),
                                  approximation=T, stepwise=T)) 
   to_return2 <- to_return1 %>%
@@ -569,7 +596,7 @@ arima_cycle0 <- function(ts.train, ts.test, target, predictors){
 
 arima_cycleN <- function(ts.train, ts.test, target, predictors, N){
   
-  to_return1 <- ts.train %>%
+  set.seed(123); to_return1 <- ts.train %>%
     model(ari = ARIMA(as.formula(paste(target, paste0(c(predictors, paste0("fourier(K=", N, ")")), collapse="+"), sep="~")),
                                  approximation=T, stepwise=T)) 
   to_return2 <- to_return1 %>%
@@ -737,6 +764,8 @@ Sivec_interpolated <- rbind(Sivec_meta,
 env_meta <- full_join(Sivec_interpolated, (LAO_meta %>% dplyr::select(-Time, -Date))) %>%
   mutate(Aeration=ifelse(Aeration=="YES", 1, 0))
 
+env_meta <- env_meta[match(unique(env_meta$DateTime), env_meta$DateTime),]
+
 date2timedate <- LAO_meta$DateTime
 names(date2timedate) <- LAO_meta$Date
 
@@ -795,11 +824,11 @@ env_meta[,selected.env3] <- env_meta[,selected.env3] %>%
 
 ```{r Arima predictions}
 
+set.seed(123)
+
 date2timedate <- LAO_meta$DateTime
 names(date2timedate) <- LAO_meta$Date
 
-selected.env_lag <- selected.env3 <- c("PO4.P", "Temp_manual", "Dry_matter", "Conductivity", "Aeration", "Vat1_NH4.N", "Vat2_NH4.N", "Nitrat", "Inflow_Volume", "NH4", "Oxygen", "Vat2_pH", "Oxygen_manual", "pH_manual", "Inflow_pH")
-selected.env <- selected.env3 <- c("PO4.P", "Temp_manual", "Dry_matter", "Conductivity", "Aeration", "Vat1_NH4.N", "Vat2_NH4.N", "Nitrat", "Inflow_Volume", "NH4", "Oxygen", "Vat2_pH", "Oxygen_manual", "pH_manual", "Inflow_pH")
 selected.env_lag <- selected.env3 <- selected.env <- c( "Dry_matter", "PO4.P", "Nitrat", "NH4", "Oxygen", "Conductivity", "pH_manual", "Temp_manual", "Oxygen_manual",
                                                         "Inflow_Volume", "Inflow_pH",
                                                         "Vat1_NH4.N",
@@ -1043,10 +1072,12 @@ ggsave(paste0(wd, "/results/figures/Expl_Ps_corr_smallMRS.svg"), Omics.expl.Ps.p
 
 ### Multimodel forecasting
 
-```{r Multimodel forecasting}
+```{r Multimodel forecasting, cache=TRUE}
 
 library(fable.prophet)
 library(distributional)
+
+#set.seed(123)
 
 date2timedate <- LAO_meta$DateTime
 names(date2timedate) <- LAO_meta$Date
@@ -1115,7 +1146,7 @@ for(i in 1:17){
   ts.tot <- ts.pred %>%
     bind_rows(ts.test)
   
-  fit <- ts.pred %>%
+  set.seed(123); fit <- ts.pred %>%
     model(
       arima0 = ARIMA(value~PO4.P+Temp_manual+Dry_matter+Conductivity+Aeration+Vat1_NH4.N+Vat2_NH4.N+Nitrat+
                       Inflow_Volume+NH4+Oxygen+Vat2_pH+Oxygen_manual+pH_manual+Inflow_pH),
@@ -1149,7 +1180,7 @@ for(i in 1:17){
       nnetar30 = NNETAR(value~PO4.P+Temp_manual+Dry_matter+Conductivity+Aeration+Vat1_NH4.N+Vat2_NH4.N+Nitrat+
                       Inflow_Volume+NH4+Oxygen+Vat2_pH+Oxygen_manual+pH_manual+Inflow_pH, n_nodes=30, scale_inputs=F))
   
-  fc <- fit %>% fabletools::forecast(to_predict, times=20)
+  fc <- fit %>% fabletools::forecast(new_data=to_predict, times=20)
   a <- fc %>% accuracy(ts.pred) %>% print()
   models.weights <- (1/abs(a$RMSE))/(sum(1/abs(a$RMSE)))
   models.weights <- ifelse(models.weights >= sort(models.weights, decreasing=T)[3], models.weights, 0)
@@ -1182,7 +1213,8 @@ for(i in 1:17){
   
   to.plot.cycle <- combined %>%
     mutate(q05=quantile(value, 0.05), q95=quantile(value, 0.95)) %>%
-    filter(.model%in%a1$.model[models.weights1>0]) %>%
+    #filter(.model%in%a1$.model[models.weights1>0]) %>%
+    filter(.model%in%(a1 %>% arrange(RMSE) %>% pull(.model))[1]) %>%
     ggplot(aes(x=as.Date(date), y=median(value))) +
     geom_ribbon(aes(ymin=q05, ymax=q95, fill=.model), alpha=0.3) +
     geom_line(aes(group=.model, color=.model)) +
@@ -1198,12 +1230,13 @@ for(i in 1:17){
   combined %>% as_fable(".mean", "value") %>% accuracy((ts.test %>% dplyr::select(date, value) %>% mutate(.mean=value))) %>% print()
 
   values.cycle <- ts.tot %>%
-    mutate(real.value=value, data.set=ifelse(as.Date(date) < as.Date("2012-06-01"), "train", "test")) %>%
+    mutate(real.value=value, data.set=ifelse(as.Date(date) < as.Date("2012-05-28"), "train", "test")) %>% # Changed from "2012-06-01" to "2012-05-28"
     dplyr::select(date, real.value, data.set) 
   
   if(i==1){
     best.models <- left_join(combined %>%
-      filter(.model%in%a1$.model[models.weights1>0]) %>%
+      #filter(.model%in%a1$.model[models.weights1>0]) %>%
+      filter(.model%in%(a1 %>% arrange(RMSE) %>% pull(.model))[1]) %>%
       mutate(signal=paste0("S", i)) %>%
       as.data.frame(),
       values.cycle)
@@ -1215,7 +1248,8 @@ for(i in 1:17){
   } else {
     best.models <- best.models %>%
       bind_rows(left_join(combined %>%
-                   filter(.model%in%a1$.model[models.weights1>0]) %>%
+                   #filter(.model%in%a1$.model[models.weights1>0]) %>%
+                     filter(.model%in%(a1 %>% arrange(RMSE) %>% pull(.model))[1]) %>%
                    mutate(signal=paste0("S", i)) %>%
       as.data.frame(),
       values.cycle))
@@ -1282,15 +1316,20 @@ signal.forecast.plot <- best.models %>%
   ggplot(aes(x=as.Date(date), y=median(value))) +
   geom_ribbon(aes(ymin=q05, ymax=q95, fill=.model), alpha=0.3) +
   geom_line(aes(group=.model, color=.model)) +
-  geom_point(data=subset(best.models, data.set=="train"), aes(x=as.Date(date), y=real.value), color="darkgreen") +
-  geom_point(data=subset(best.models, data.set=="test"), aes(x=as.Date(date), y=real.value), color="darkred") +
+  geom_point(data=subset((best.models %>%
+                            mutate(data.set=case_when(date>as.Date("2012-05-01") ~ "test",
+                            .default = "train"))),
+                         data.set=="train"), aes(x=as.Date(date), y=real.value), color="darkgreen") +
+  geom_point(data=subset((best.models %>%
+                            mutate(data.set=case_when(date>as.Date("2012-05-01") ~ "test",
+                            .default = "train"))), data.set=="test"), aes(x=as.Date(date), y=real.value), color="darkblue") +
   theme_classic() +
   facet_wrap(factor(signal, levels=paste0("S", 1:17))~., ncol=2)
 
 rmse.plot <- best.models %>%
   mutate(date=as.Date(date),
-         Set=case_when(date<"2012-06-01" ~ "Train",
-                       date>="2012-06-01" & date<"2013-06-01" ~ "Test2012",
+         Set=case_when(date < as.Date("2012-05-28") ~ "Train", # beginning of W22 2012
+                       date>="2012-05-01" & date<"2013-06-01" ~ "Test2012",
                        date>="2013-06-01" & date<"2014-06-01" ~ "Test2013",
                        date>="2014-06-01" & date<"2015-06-01" ~ "Test2014",
                        date>="2015-06-01" & date<"2016-06-01" ~ "Test2015",
@@ -1300,7 +1339,8 @@ rmse.plot <- best.models %>%
   group_by(group_set, .model, signal) %>%
   mutate(diff.value=median(value)-real.value) %>%
   ggplot(aes(x=factor(group_set, levels=c("Train", "Test")), y=diff.value, color=group_set)) +
-  scale_color_manual(values=c("darkred", "darkgreen")) +
+  scale_color_manual(values=c("darkblue", "darkgreen")) +
+  scale_y_continuous(breaks = c(-0.25, 0, 0.25)) +
   geom_point() +
   geom_boxplot() +
   facet_wrap(factor(signal, levels=paste0("S", 1:17))~., ncol=2) +
@@ -1308,8 +1348,8 @@ rmse.plot <- best.models %>%
   labs(x="Set of data")
 
 WN.P.table <- best.models %>% mutate(date=as.Date(date),
-                     Set=case_when(date<"2012-06-01" ~ "Train",
-                       date>="2012-06-01" & date<"2013-06-01" ~ "Test2012",
+                     Set=case_when(date < as.Date("2012-05-28") ~ "Train",
+                       date>="2012-05-01" & date<"2013-06-01" ~ "Test2012",
                        date>="2013-06-01" & date<"2014-06-01" ~ "Test2013",
                        date>="2014-06-01" & date<"2015-06-01" ~ "Test2014",
                        date>="2015-06-01" & date<"2016-06-01" ~ "Test2015",
@@ -1326,8 +1366,16 @@ WN.P.table <- best.models %>% mutate(date=as.Date(date),
   pivot_wider(names_from="group_set", values_from="test")
 
 WN.P.table
+WN.P.parsed <- WN.P.table %>%
+  mutate(Train_significative=if_else(Train<0.01, 1, 0),
+         Test_significative=if_else(Test<0.01, 1, 0)) %>%
+  separate(signal, into = c("S", "num"), 1, remove=F) %>%
+  mutate(num=as.numeric(num)) %>%
+  arrange(num) %>%
+  dplyr::select(signal, Train, Test, Train_significative, Test_significative)
+WN.P.parsed
 
-
+write.csv(WN.P.parsed, file=paste0(wd, "/results/tables/residuals_Ps.csv"), row.names=F)
 
 ggsave(paste0(wd, "/results/figures/signal_forecast.png"), signal.forecast.plot, dpi=320, height=10, width=16)
 ggsave(paste0(wd, "/results/figures/signal_forecast.svg"), signal.forecast.plot, dpi=320, height=10, width=16)
@@ -1336,6 +1384,17 @@ ggsave(paste0(wd, "/results/figures/signal_rmse.svg"), rmse.plot, dpi=320, heigh
 
 ```
 
+
+### Output EVs
+
+```{r Output EVs}
+signals.EVs %>%
+  filter(module %in% c("S1", "S4", "S7", "S9", "S14", "S17")) %>%
+  pull(EV) %>%
+  sum()
+
+write.csv(signals.EVs, file=paste0(wd, "/results/tables/signals_EVs.csv"), row.names=F)
+```
 
 ### Rewriting pathways
 
@@ -1388,10 +1447,10 @@ for(omic.type in omic_type){
 
 ```{r Forecasting MG pathways}
 
-MG.pathway.coeff.mat[-1,]
+#MG.pathway.coeff.mat[-1,]
 
 forecast.block <- as.data.frame(best.models) %>%
-  filter(.model!="arima0") %>%
+  #filter(.model!="arima0") %>%
   mutate(date=tsibble::yearweek(as.Date(date)),
          pred.value=median(value)) %>%
   filter(date%in%tsibble::yearweek(colnames(MG.fun.C_name.test.clr.corr))) %>%
@@ -1453,10 +1512,10 @@ ggsave(paste0(wd, "/results/figures/MG_path_forecasting.png"), MG.path.forecasti
 
 ```{r Forecasting MT pathways}
 
-MT.pathway.coeff.mat[-1,]
+#MT.pathway.coeff.mat[-1,]
 
 forecast.block <- as.data.frame(best.models) %>%
-  filter(.model!="arima0") %>%
+  #filter(.model!="arima0") %>%
   mutate(date=tsibble::yearweek(as.Date(date)),
          pred.value=median(value)) %>%
   filter(date%in%tsibble::yearweek(colnames(MT.fun.C_name.test.clr.corr))) %>%
@@ -1566,7 +1625,7 @@ for(omic.type in omic_type){
 ```{r Forecasting MG Reactions}
 
 forecast.block <- as.data.frame(best.models) %>%
-  filter(.model!="arima0") %>%
+  #filter(.model!="arima0") %>%
   mutate(date=tsibble::yearweek(as.Date(date)),
          pred.value=median(value)) %>%
   filter(date%in%tsibble::yearweek(colnames(MG.fun.D_name.test.clr.corr))) %>%
@@ -1631,7 +1690,7 @@ ggsave(paste0(wd, "/results/figures/MG_react_forecasting.png"), MG.react.forecas
 #MT.Reaction.coeff.mat[-1,]
 
 forecast.block <- as.data.frame(best.models) %>%
-  filter(.model!="arima0") %>%
+  #filter(.model!="arima0") %>%
   mutate(date=tsibble::yearweek(as.Date(date)),
          pred.value=median(value)) %>%
   filter(date%in%tsibble::yearweek(colnames(MT.fun.D_name.test.clr.corr))) %>%
@@ -1739,7 +1798,7 @@ for(omic.type in omic_type){
 ```{r Forecasting MG Families}
 
 forecast.block <- as.data.frame(best.models) %>%
-  filter(.model!="arima0") %>%
+  #filter(.model!="arima0") %>%
   mutate(date=tsibble::yearweek(as.Date(date)),
          pred.value=median(value)) %>%
   filter(date%in%tsibble::yearweek(colnames(MG.tax.family.test.clr.corr))) %>%
@@ -1796,7 +1855,7 @@ ggsave(paste0(wd, "/results/figures/MG_family_forecasting.png"), MG.family.forec
 ```{r Forecasting MT Families}
 
 forecast.block <- as.data.frame(best.models) %>%
-  filter(.model!="arima0") %>%
+  #filter(.model!="arima0") %>%
   mutate(date=tsibble::yearweek(as.Date(date)),
          pred.value=median(value)) %>%
   filter(date%in%tsibble::yearweek(colnames(MT.tax.family.test.clr.corr))) %>%
@@ -1871,7 +1930,7 @@ June.dd <- rbind((MG.path.res %>%
          mutate(variable=family, block="Family", omic="MT", date=as.Date(date)) %>%
          dplyr::select(-family))) %>%
   mutate(date=tsibble::yearweek(date), Year=year(date), block_omic=paste0(block, " ", omic))
-  
+
 June.Rsq.table <- June.dd %>%
   group_by(variable, block_omic, Year) %>%
   summarise(M.pred=mean(pred.value), M.real=mean(real.value)) %>%
@@ -1881,7 +1940,36 @@ June.Rsq.table <- June.dd %>%
 
 June.Rsq.table
 
+June.average.dd <- June.dd %>%
+  group_by(Year, block, variable, omic, block_omic) %>%
+  summarise(M.pred = mean(pred.value), M.real = mean(real.value))
+
+
+write.csv(June.average.dd, file=paste0(wd, "/results/tables/June_average.csv"), row.names=F)
+
 write.csv(June.Rsq.table, file=paste0(wd, "/results/tables/June_Rsq.csv"), row.names=F)
+
+to_print_models <- as.data.frame(best.models) %>%
+  dplyr::select(.model, date, value, real.value)
+
+write.csv(to_print_models, file=paste0(wd, "/results/tables/best_models.csv"), row.names=F)
+
+to_plot_arima <- Omics.expl.Ps %>%
+  mutate(expl.block=expl_block[expl.var], expl.short=expl_short[expl.var]) %>%
+  mutate(EG_name=ifelse(mat_name=="raw",
+                        paste0(Omic, ".", mat_name, ".a.EG", EG_num),
+                        paste0(Omic, ".", mat_name, ".EG", EG_num))) %>%
+  filter(EG_name %in% noise.ff$rep_EG) %>%
+  mutate(signal_name=colors2num[non_stat2mod[EG_name]]) %>%
+  filter(EG_num!=0, !is.nan(Pvalue)) %>%
+  mutate(Pvalue=p.adjust(Pvalue, method="BH")) %>%
+  mutate(signal_name=factor(signal_name,
+                            levels=rev(levels(signal_name))),
+         sign.value=factor(sign(est.value)),
+         est.value=abs(est.value)) %>%
+  dplyr::select(Omic, expl.var, Pvalue, est.value, expl.block, expl.short, signal_name, sign.value)
+
+write.csv(to_plot_arima, file=paste0(wd, "/results/tables/arima_explained.csv"), row.names=F)
 
 June.individual.plot <- June.dd %>%
   ggplot(aes(x=pred.value, y=real.value)) +
@@ -1897,7 +1985,9 @@ ggsave(paste0(wd, "/results/figures/June_individual.svg"), June.individual.plot,
 
 June.forecasting.plot <- June.dd %>%
   group_by(variable, block_omic, Year) %>%
-  summarise(M.pred=mean(pred.value), M.real=mean(real.value)) %>%
+  summarise(M.pred=mean(pred.value), M.real=mean(real.value))
+
+June.average.dd %>%
   ggplot(aes(x=M.pred, y=M.real)) +
   geom_point() +
   geom_smooth(aes(group=1), alpha=0.1, method=glm, formula=y~x, se=0) +
@@ -1913,24 +2003,10 @@ ggsave(paste0(wd, "/results/figures/June_forecasting.svg"), June.forecasting.plo
 ```
 
 
-### June train
+### Save image
 
-```{r June train}
+```{r Save image}
 
-for(i in c("MG", "MT")){
-  for(j in c("tax.family", "fun.D_name", "fun.C_name")){
-    tmp.mat0 <- get(paste0(i, ".", j, ".train.clr.corr"))[,c("2011-06-03", "2011-06-09", "2011-06-17", "2011-06-24")]
-    tmp.mat1 <- get(paste0(i, ".", j, ".test.clr.corr"))[,c("2012-06-01", "2012-06-08", "2012-06-14", "2012-06-20", "2012-06-26")]
-    tmp.mat2 <- get(paste0(i, ".", j, ".test.clr.corr"))[,c("2013-06-06", "2013-06-12", "2013-06-18", "2013-06-25")]
-    tmp.mat3 <- get(paste0(i, ".", j, ".test.clr.corr"))[,c("2014-06-04", "2014-06-13", "2014-06-18", "2014-06-26")]
-    tmp.mat4 <- get(paste0(i, ".", j, ".test.clr.corr"))[,c("2015-06-04", "2015-06-10", "2015-06-17", "2015-06-25")]
-    tmp.mat5 <- get(paste0(i, ".", j, ".test.clr.corr"))[,c("2016-06-02", "2016-06-06", "2016-06-13", "2016-06-22")]
-    print(median(rowMeans(tmp.mat1)/rowMeans(tmp.mat0)))
-    print(median(rowMeans(tmp.mat2)/rowMeans(tmp.mat0)))
-    print(median(rowMeans(tmp.mat3)/rowMeans(tmp.mat0)))
-    print(median(rowMeans(tmp.mat4)/rowMeans(tmp.mat0)))
-    print(median(rowMeans(tmp.mat5)/rowMeans(tmp.mat0)))
-  }
-}
+save.image(file=paste0(wd, "/preprocessed/output.RData"))
 
 ```

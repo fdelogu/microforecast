@@ -36,6 +36,8 @@ library(ggnewscale)
 library(WGCNA)
 library(GOstats)
 library(lmtest)
+library(ade4)
+library(rEDM)
 
 wd <- getwd()
 
@@ -225,6 +227,99 @@ ggsave(paste0(wd, "/results/figures/NonStatEGsComparison_corrMRS.svg"), Non.Stat
 
 ```
 
+### Eigenvalue plots
+
+```{r Eigenvalue plots}
+
+omic_type <- c("MG", "MT", "MP")
+fun_lvl <- paste("fun", c("C_name", "D_name"), sep=".")
+tax_lvl <- paste("tax", c("phylum", "class", "order", "family", "genus", "species"), sep=".")
+subsets <- c(fun_lvl, tax_lvl)
+
+EGval.comp <- data.frame(omic_type=c(), subset=c(), index=c(), value=c(), NonStat=c())
+
+for(i in omic_type){
+  for(j in c("raw", subsets)){
+    if(startsWith(i, "MO")){
+      set_cycle <- paste(i, j, "NonStatEG", sep=".")
+      EGval_cycle <- paste(i, j, "train.svd", sep=".")
+    } else {
+      set_cycle <- paste(i, j, "NonStatEG.corr", sep=".")
+      EGval_cycle <- paste(i, j, "train.svd.corr", sep=".")
+    }
+    tmp.mat <- get(EGval_cycle)$d
+    N <- length(tmp.mat)
+    tmp.NonStat <- get(set_cycle)
+    
+    tmp.df <- data.frame(omic_type=rep(i, N), subset=rep(j, N), index=1:N, value=tmp.mat, NonStat=(((1:N)%in%tmp.NonStat)+0))
+    
+    EGval.comp <- rbind(EGval.comp, tmp.df)
+  }
+}
+
+first.EVs <- EGval.comp %>%
+  group_by(omic_type, subset) %>%
+  mutate(s=sum(value), value.frac=value/s,
+         subset=if_else(subset=="raw", ".raw", subset)) %>%
+  filter(index==1) %>%
+  pull(value.frac)
+
+round(mean(first.EVs)*100, digits=2)
+round(sd(first.EVs)*100, digits=2)
+
+EGval.comp %>%
+  group_by(omic_type, subset) %>%
+  mutate(s=sum(value), value.frac=value/s,
+         subset=if_else(subset=="raw", ".raw", subset)) %>%
+  separate(subset, into=c("to_delete", "subset", remove=T, sep=".")) %>%
+  mutate(subset=case_when(subset=="C" ~ "Pathway",
+                          subset=="D" ~ "Reaction",
+                          subset=="raw" ~ "ORFs",
+                          .default = subset)) %>%
+  ggplot(aes(x=index, y=value.frac, group=1)) +
+  geom_point() +
+  geom_line() +
+  facet_grid(subset~omic_type, scales="free") +
+  theme_minimal() +
+  labs(x="EG index", y="Fractional eigevalue")
+
+EGval.comp %>%
+  filter(index!=1) %>%
+  group_by(omic_type, subset) %>%
+  mutate(s=sum(value), value.frac=value/s,
+         subset=if_else(subset=="raw", ".raw", subset)) %>%
+  separate(subset, into=c("to_delete", "subset", remove=T, sep=".")) %>%
+  mutate(subset=case_when(subset=="C" ~ "Pathway",
+                          subset=="D" ~ "Reaction",
+                          subset=="raw" ~ "ORFs",
+                          .default = subset)) %>%
+  ggplot(aes(x=index, y=value.frac, group=1)) +
+  geom_point() +
+  geom_line() +
+  facet_grid(subset~omic_type, scales="free") +
+  theme_minimal() +
+  labs(x="EG index", y="Fractional eigevalue")
+
+EGval.comp %>%
+  filter(index!=1) %>%
+  mutate(NonStat=if_else(NonStat==1, "Time.dependent", "Time.independent")) %>%
+  group_by(omic_type, subset) %>%
+  mutate(s=sum(value), value.frac=value/s,
+         subset=if_else(subset=="raw", ".raw", subset)) %>%
+  separate(subset, into=c("to_delete", "subset", remove=T, sep=".")) %>%
+  mutate(subset=case_when(subset=="C" ~ "Pathway",
+                          subset=="D" ~ "Reaction",
+                          subset=="raw" ~ "ORFs",
+                          .default = subset)) %>%
+  ggplot(aes(x=index, y=value.frac, group=1)) +
+  geom_point(aes(color=NonStat)) +
+  geom_line() +
+  facet_grid(subset~omic_type, scales="free") +
+  theme_minimal() +
+  labs(x="EG index", y="Fractional eigevalue")
+
+```
+
 ## EG analysis
 
 ### Time-dependent EG correlations
@@ -276,6 +371,39 @@ Adj0 <- cor((all.EGs[1:nrow(all.EGs),] %>%
 ```
 
 
+### EG dist comparison
+
+```{r, EGs dist comparison}
+
+EG.dist.euclidean <- dist((Adj0), method="euclidean")
+EG.dist.maximum <- dist((Adj0), method="maximum")
+EG.dist.minkowski <- dist((Adj0), method="minkowski")
+EG.dist.manhattan <- dist((Adj0), method="manhattan")
+EG.dist.canberra <- dist((Adj0), method="canberra")
+
+EG.dist.list <- list(EG.dist.euclidean, EG.dist.maximum, EG.dist.minkowski, EG.dist.manhattan, EG.dist.canberra)
+N <- length(EG.dist.list)
+EG.dist.mat <- matrix(nrow=N, ncol=N) %>%
+  `colnames<-`(c("euclidean", "maximum", "minkowski", "manhattan", "canberra")) %>%
+  `rownames<-`(c("euclidean", "maximum", "minkowski", "manhattan", "canberra"))
+EG.dist.ps <- matrix(nrow=N, ncol=N) %>%
+  `colnames<-`(c("euclidean", "maximum", "minkowski", "manhattan", "canberra")) %>%
+  `rownames<-`(c("euclidean", "maximum", "minkowski", "manhattan", "canberra"))
+
+for(i in 1:N){
+  for(j in 1:N){
+    EG.dist.mat[i,j] <- mantel.rtest(EG.dist.list[[i]], EG.dist.list[[j]])$obs
+    EG.dist.ps[i,j] <- mantel.rtest(EG.dist.list[[i]], EG.dist.list[[j]])$pvalue
+  }
+}
+
+corrplot::corrplot.mixed(EG.dist.mat)
+EG.dist.ps %>%
+  as.data.frame() %>%
+  knitr::kable()
+
+```
+
 ### EG clustering
 
 ```{r, EGs clustering}
@@ -294,7 +422,7 @@ dynamicColors <- labels2colors(dynamicMods)
 table(dynamicColors)
 
 sizeGrWindow(8,6)
-plotDendroAndColors(EG.hc, dynamicColors, "Dynamic Tree Cut", dendroLabels=F, hang=0.03, addGuide=T, guideHang=0.05, main="Gene dendrogram and module colors")
+plotDendroAndColors(EG.hc, dynamicColors, "Dynamic Tree Cut", dendroLabels=F, hang=0.03, addGuide=T, guideHang=0.05, main="Eigengene clustering")
 
 ```
 
@@ -479,6 +607,7 @@ signals.plot <- as.data.frame((all.EGs[sampled_weeks, ] %>% `colnames<-`(EG_name
   ggplot(aes(x=as.Date(Sample), y=value, group=EG_name)) +
   geom_point() +
   geom_line() +
+  geom_smooth(se=0, alpha=.5) +
   facet_wrap(module~., ncol=4, scales="free") +
   theme_classic()
 
@@ -563,13 +692,115 @@ for(i in rownames(granger.mat)){
     if(i != j){
       granger.mat[i,j] <- (grangertest(weekly_imputed[,noise.ff$rep_EG][,i],
                                        weekly_imputed[,noise.ff$rep_EG][,j],
-                                       order=10, na.action=na.omit))$`Pr(>F)`[2]
+                                       order=16, na.action=na.omit))$`Pr(>F)`[2] # order = number of lag weeks to check across
     }
   }
 }
 
 sum(granger.mat<0.05, na.rm=T)
 
+```
+
+### Nonlinearity checks
+
+```{r, Nonlinearity checks}
+
+EG.mat.wi <- weekly_imputed[,noise.ff$rep_EG]
+colnames(EG.mat.wi) <- colors2num[non_stat2mod[colnames(EG.mat.wi)]]
+
+vars <- colnames(EG.mat.wi)
+simplex_out <- lapply(vars, function(var) {
+    simplex(EG.mat.wi[,var], E=1:20)
+})
+names(simplex_out) <- vars
+
+embedding.plot <- bind_rows(simplex_out) %>%
+  mutate(signal=unlist(lapply(names(simplex_out), rep, 20)),
+         signal=factor(signal, levels=paste0("S", 1:17)),
+         rho=unlist(rho)) %>%
+  ggplot(aes(x=E, y=rho)) +
+  geom_line() +
+  facet_wrap(signal~., ncol=6, scales="free") +
+  theme_classic() +
+  labs(x="Embedding dimensions (E)", y="Forecast Skill (rho)")
+
+embedding.plot
+ggsave(paste0(wd, "/results/figures/embedding.png"), embedding.plot, dpi=320, height=4.5, width=10)
+ggsave(paste0(wd, "/results/figures/embedding.svg"), embedding.plot, dpi=320, height=4.5, width=10)
+
+best_E <- sapply(simplex_out, function(df) {
+    df$E[which.max(df$rho)]
+})
+best_E
+
+smap_out <- lapply(vars, function(var) {
+    s_map(EG.mat.wi[,var], E = best_E[var])
+})
+names(smap_out) <- names(simplex_out)
+
+nonlinearity.plot <- bind_rows(smap_out) %>%
+  mutate(signal=unlist(lapply(names(simplex_out), rep, 18)),
+         signal=factor(signal, levels=paste0("S", 1:17)),
+         rho=unlist(rho)) %>%
+  ggplot(aes(x=theta, y=rho)) +
+  geom_line() +
+  facet_wrap(signal~., ncol=6, scales="free") +
+  theme_classic() +
+  labs(x="Nonlinearity (theta)", y="Forecast Skill (rho)")
+
+nonlinearity.plot
+ggsave(paste0(wd, "/results/figures/nonlinearity.png"), nonlinearity.plot, dpi=320, height=4.5, width=10)
+ggsave(paste0(wd, "/results/figures/nonlinearity.svg"), nonlinearity.plot, dpi=320, height=4.5, width=10)
+
+```
+
+### Convergent Cross Mapping validation of nonlinear links
+
+```{r, Convergent Cross Mapping validation of nonlinear links}
+
+S7_xmap_S8 <- ccm(EG.mat.wi, lib = segments, pred = segments, lib_column = "S7", 
+    target_column = "S8", E = best_E["S7"], silent = T, replace = T, stats_only = T, lib_sizes=c(20, 50, 1))
+S4_xmap_S8 <- ccm(EG.mat.wi, lib = segments, pred = segments, lib_column = "S4", 
+    target_column = "S8", E = best_E["S4"], silent = T, replace = T, stats_only = T, lib_sizes=c(20, 50, 1))
+S9_xmap_S8 <- ccm(EG.mat.wi, lib = segments, pred = segments, lib_column = "S9", 
+    target_column = "S8", E = best_E["S9"], silent = T, replace = T, stats_only = T, lib_sizes=c(20, 50, 1))
+S10_xmap_S17 <- ccm(EG.mat.wi, lib = segments, pred = segments, lib_column = "S10", 
+    target_column = "S17", E = best_E["S10"], silent = T, replace = T, stats_only = T, lib_sizes=c(20, 50, 1))
+S1_xmap_S17 <- ccm(EG.mat.wi, lib = segments, pred = segments, lib_column = "S1", 
+    target_column = "S17", E = best_E["S1"], silent = T, replace = T, stats_only = T, lib_sizes=c(20, 50, 1))
+S6_xmap_S8 <- ccm(EG.mat.wi, lib = segments, pred = segments, lib_column = "S6", 
+    target_column = "S7", E = best_E["S6"], silent = T, replace = T, stats_only = T, lib_sizes=c(20, 50, 1))
+S5_xmap_S8 <- ccm(EG.mat.wi, lib = segments, pred = segments, lib_column = "S5", 
+    target_column = "S7", E = best_E["S5"], silent = T, replace = T, stats_only = T, lib_sizes=c(20, 50, 1))
+
+CCM.plot <- rbind((S7_xmap_S8 %>%
+  pivot_longer(names_to="Direction", -c(LibSize, E, tau, tp, nn))),
+  (S4_xmap_S8 %>%
+  pivot_longer(names_to="Direction", -c(LibSize, E, tau, tp, nn))),
+  (S9_xmap_S8 %>%
+  pivot_longer(names_to="Direction", -c(LibSize, E, tau, tp, nn))),
+  (S10_xmap_S17 %>%
+  pivot_longer(names_to="Direction", -c(LibSize, E, tau, tp, nn))),
+  (S1_xmap_S17 %>%
+  pivot_longer(names_to="Direction", -c(LibSize, E, tau, tp, nn))),
+  (S6_xmap_S8 %>%
+  pivot_longer(names_to="Direction", -c(LibSize, E, tau, tp, nn))),
+  (S5_xmap_S8 %>%
+  pivot_longer(names_to="Direction", -c(LibSize, E, tau, tp, nn)))) %>%
+  dplyr::select(LibSize, Direction, value) %>%
+  mutate(Edge=lapply(str_split(Direction, ":"), sort)) %>%
+  mutate(Direction=gsub(pattern=":", replacement="->", x=Direction)) %>%
+  rowwise() %>%
+  mutate(Edge=paste(Edge, collapse="-")) %>%
+  ggplot(aes(x=LibSize, y=value, group=Direction, color=Direction)) +
+  geom_line() +
+  theme_classic() +
+  facet_wrap(Edge~., nrow=3, scales="free") +
+  labs(x="Library Size", y="Cross Map Skill (rho)")
+
+CCM.plot
+ggsave(paste0(wd, "/results/figures/CCM.png"), CCM.plot, dpi=320, height=4.5, width=7)
+ggsave(paste0(wd, "/results/figures/CCM.svg"), CCM.plot, dpi=320, height=4.5, width=7)
 ```
 
 ### Granger causality persisten homology
@@ -663,6 +894,13 @@ to_cytoscape <- as.data.frame(granger.mat) %>%
 hist(to_cytoscape$value)# better with filter value>0
 
 write_csv(to_cytoscape, paste0(wd, "/results/tables/Signal_netMRS_Min.csv"))
+
+print_full_Ps <- as.data.frame(granger.mat) %>%
+  rownames_to_column(var="Origin") %>%
+  pivot_longer(names_to="Target", values_to="value", -c(Origin)) %>%
+  mutate(Origin=colors2num[non_stat2mod[Origin]], Target=colors2num[non_stat2mod[Target]])
+
+write_csv(print_full_Ps, paste0(wd, "/results/tables/granger_Ps.csv"))
 
 ```
 
